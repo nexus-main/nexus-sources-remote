@@ -136,7 +136,7 @@ class Test(TestBase, IDataSource[TestSettings]):
         return actual_file_count / max_file_count
 
     def read(self, 
-        begin: datetime, 
+        begin: datetime,
         end: datetime,
         requests: list[ReadRequest], 
         read_data: ReadDataHandler,
