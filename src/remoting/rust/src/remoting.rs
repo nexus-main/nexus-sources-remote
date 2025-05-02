@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::TcpStream;
 use std::io::Result;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 trait JsonRpcMessage : Serialize {}
 
@@ -68,7 +68,9 @@ impl RemoteCommunicator {
         comm_stream: TcpStream,
         data_stream: TcpStream,
     ) -> Self {
-        let logger = MyLogger { comm_stream };
+        let logger = MyLogger { 
+            comm_stream: comm_stream.clone()
+        };
 
         Self {
             comm_stream,
@@ -76,6 +78,11 @@ impl RemoteCommunicator {
             watchdog_timer: Instant::now(),
             logger,
         }
+    }
+
+    /// Returns the duration since the last communication.
+    pub fn last_communication(&self) -> Duration {
+        Instant::now().duration_since(self.watchdog_timer)
     }
 
     /// Starts the remoting operation.
@@ -91,7 +98,7 @@ impl RemoteCommunicator {
 
             send_to_server(response, &mut self.comm_stream).await?;
         }
-        todo!("Timeout for stream reading!!");
+        // todo!("Timeout for stream reading!!"); // https://doc.rust-lang.org/std/net/struct.TcpStream.html#method.write_timeout
     }
 
     async fn process_invocation(

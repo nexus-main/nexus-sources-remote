@@ -1,5 +1,6 @@
 {
     "rust-analyzer.linkedProjects": [
+        "src/agent/rust/Cargo.toml",
         "src/remoting/rust/Cargo.toml"
     ]
 }

@@ -75,6 +75,9 @@ class RemoteCommunicator:
 
     @property
     def last_communication(self) -> timedelta:
+        """
+        Returns the duration since the last communication.
+        """
         now = time.time()
         return timedelta(seconds=now - self._watchdog_timer)
 

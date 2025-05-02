@@ -4,7 +4,6 @@ using Moq;
 using Nexus.DataModel;
 using Nexus.Extensibility;
 using System.Text.Json;
-using System.Text.Json.Nodes;
 using Xunit;
 
 namespace Nexus.Sources.Tests;

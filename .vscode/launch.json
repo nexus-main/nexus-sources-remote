@@ -28,6 +28,22 @@
                 "NEXUSAGENT_PATHS__CONFIG": "../../../.nexus-agent-python/config",
                 "NEXUSAGENT_SYSTEM__JSONRPCLISTENPORT": "60001"
             }
+        },
+        {
+            "name": "Nexus.Agent (rust)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--manifest-path=src/agent/rust/Cargo.toml"
+                ]
+            },
+            "cwd": "${workspaceFolder}/src/agent/rust",
+            "env": {
+                "NEXUSAGENT_PATHS__CONFIG": "../../../.nexus-agent-python/config",
+                "NEXUSAGENT_SYSTEM__JSONRPCLISTENPORT": "60001"
+            }
         }
     ]
 }

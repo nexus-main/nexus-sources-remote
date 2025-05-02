@@ -67,17 +67,17 @@ internal class AgentService
 
     public Task AcceptClientsAsync(CancellationToken cancellationToken)
     {
-        _logger.LogInformation(
-            "Listening for JSON-RPC communication on {JsonRpcListenAddress}:{JsonRpcListenPort}",
-            _systemOptions.JsonRpcListenAddress, _systemOptions.JsonRpcListenPort
-        );
-
         var tcpListener = new TcpListener(
             IPAddress.Parse(_systemOptions.JsonRpcListenAddress),
             _systemOptions.JsonRpcListenPort
         );
 
         tcpListener.Start();
+
+        _logger.LogInformation(
+            "Listening for JSON-RPC communication on {JsonRpcListenAddress}:{JsonRpcListenPort}",
+            _systemOptions.JsonRpcListenAddress, _systemOptions.JsonRpcListenPort
+        );
 
         // Detect and remove inactivate clients
         _ = Task.Run(async () =>

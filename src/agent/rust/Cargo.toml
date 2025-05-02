@@ -1,0 +1,11 @@
+[package]
+name = "nexus-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11.8"
+log = "0.4.27"
+nexus-remoting = { path = "../../remoting/rust" }
+smol = "2.0.2"
+uuid = "1.16.0"

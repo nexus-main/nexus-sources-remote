@@ -1,5 +1,4 @@
 import asyncio
-import socket
 import time
 import uuid
 from datetime import timedelta
@@ -79,16 +78,16 @@ class AgentService:
 
         self._create_task(detect_and_remove_inactive_clients())
         
-        self._logger.info(
-            "Listening for JSON-RPC communication on %s:%d",
-            self._json_rpc_listen_address,
-            self._json_rpc_listen_port
-        )
-
         server = await asyncio.start_server(
             self._handle_client, 
             host=self._json_rpc_listen_address,
             port=self._json_rpc_listen_port
+        )
+
+        self._logger.info(
+            "Listening for JSON-RPC communication on %s:%d",
+            self._json_rpc_listen_address,
+            self._json_rpc_listen_port
         )
 
         async with server:
