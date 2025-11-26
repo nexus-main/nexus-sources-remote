@@ -49,7 +49,7 @@ class Test(TestBase, IDataSource[TestSettings]):
 
         logger.log(LogLevel.Information, self._context.source_configuration.log_message)
 
-    async def get_catalog_registrations(self, path: str):
+    async def get_catalog_registrations(self, path: str) -> list[CatalogRegistration]:
 
         if path == "/":
             return [

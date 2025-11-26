@@ -9,7 +9,7 @@
     <PackageVersion Include="BenchmarkDotNet" Version="0.14.0" />
     <PackageVersion Include="Microsoft.AspNetCore.Mvc.Versioning.ApiExplorer" Version="5.1.0" />
     <PackageVersion Include="Moq" Version="4.20.72" />
-    <PackageVersion Include="Nexus.Extensibility" Version="2.0.0-beta.50" />
+    <PackageVersion Include="Nexus.Extensibility" Version="2.0.0-beta.53" />
     <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="9.0.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageVersion Include="NSwag.AspNetCore" Version="14.1.0" />
