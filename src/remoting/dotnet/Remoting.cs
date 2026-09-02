@@ -2,11 +2,13 @@ using Microsoft.Extensions.Logging;
 using Nexus.DataModel;
 using Nexus.Extensibility;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
@@ -74,6 +76,8 @@ public class RemoteCommunicator
 
     private IDataSource? _dataSource = default;
 
+    private readonly SemaphoreSlim _frameWriteLock = new(1, 1);
+
     /// <summary>
     /// Initializes a new instance of the <see cref="RemoteCommunicator" />.
     /// </summary>
@@ -130,8 +134,7 @@ public class RemoteCommunicator
                 var request = Read(messageMemory.Span);
 
                 // process message
-                Memory<byte> data = default;
-                Memory<byte> status = default;
+                List<RawPayload> payloads = [];
                 JsonObject? response;
 
                 if (request.TryGetProperty("jsonrpc", out var element) &&
@@ -142,7 +145,7 @@ public class RemoteCommunicator
                     {
                         try
                         {
-                            (var result, data, status) = await ProcessInvocationAsync(request, cancellationToken);
+                            (var result, payloads) = await ProcessInvocationAsync(request, cancellationToken);
                             _watchdogTimer.Restart();
 
                             response = new JsonObject()
@@ -184,17 +187,21 @@ public class RemoteCommunicator
                 await Utilities.SendToServerAsync(response, _commStream, cancellationToken);
 
                 // send data
-                if (!data.Equals(default) && !status.Equals(default))
+                if (payloads.Count > 0)
                 {
-                    await _dataStream.WriteAsync(data);
-                    await _dataStream.WriteAsync(status);
+                    foreach (var payload in payloads)
+                    {
+                        await _dataStream.WriteAsync(payload.Data);
+                        await _dataStream.WriteAsync(payload.Status);
+                    }
+
                     await _dataStream.FlushAsync();
                 }
             }
         });
     }
 
-    private async Task<(JsonNode?, Memory<byte>, Memory<byte>)> ProcessInvocationAsync(
+    private async Task<(JsonNode?, List<RawPayload>)> ProcessInvocationAsync(
         JsonElement request, 
         CancellationToken cancellationToken
     )
@@ -202,8 +209,7 @@ public class RemoteCommunicator
 #warning Use strongly typed deserialization instead?
 
         JsonNode? result = default;
-        Memory<byte> data = default;
-        Memory<byte> status = default;
+        var payloads = new List<RawPayload>();
 
         var methodName = request.GetProperty("method").GetString();
         var @params = request.GetProperty("params");
@@ -211,7 +217,6 @@ public class RemoteCommunicator
         if (methodName == "initialize")
         {
             _sourceTypeName = @params[0].ToString();
-            result = 1; // API version
         }
 
         else if (methodName == "upgradeSourceConfiguration")
@@ -342,7 +347,7 @@ public class RemoteCommunicator
             result = availability;
         }
 
-        else if (methodName == "readSingle")
+        else if (methodName == "read")
         {
             if (_dataSource is null)
                 throw new Exception("The data source context must be set before invoking other methods.");
@@ -353,20 +358,55 @@ public class RemoteCommunicator
             var endString = @params[1].GetString()!;
             var end = DateTime.ParseExact(endString, "o", CultureInfo.InvariantCulture).ToUniversalTime();
 
-            var originalResourceName = @params[2].GetString()!;
+            var remoteReadRequests = JsonSerializer.Deserialize<RemoteReadRequest[]>(@params[2], Utilities.JsonSerializerOptions)!;
+            var readRequests = new ReadRequest[remoteReadRequests.Length];
+            var streamedIndices = new HashSet<int>();
 
-            var catalogItem = JsonSerializer.Deserialize<CatalogItem>(@params[3], Utilities.JsonSerializerOptions)!;
-            (data, status) = ExtensibilityUtilities.CreateBuffers(catalogItem.Representation, begin, end);
-            var readRequest = new ReadRequest(originalResourceName, catalogItem, data, status);
+            for (int i = 0; i < remoteReadRequests.Length; i++)
+            {
+                var (data, status) = ExtensibilityUtilities.CreateBuffers(remoteReadRequests[i].CatalogItem.Representation, begin, end);
+                var index = i;
 
-            await _dataSource.ReadAsync(
-                begin,
-                end,
-                [readRequest],
-                HandleReadDataAsync,
-                new Progress<double>(),
-                CancellationToken.None
-            );
+                Func<CancellationToken, Task> onCompleted = async ct =>
+                {
+                    await WriteDataFrameAsync(index, data, status, ct);
+                    streamedIndices.Add(index);
+                };
+
+                readRequests[i] = new ReadRequest(
+                    remoteReadRequests[i].OriginalResourceName,
+                    remoteReadRequests[i].CatalogItem,
+                    data,
+                    status,
+                    onCompleted);
+            }
+
+            try
+            {
+                await _dataSource.ReadAsync(
+                    begin,
+                    end,
+                    readRequests,
+                    HandleReadDataAsync,
+                    new Progress<double>(),
+                    cancellationToken);
+
+                for (int i = 0; i < readRequests.Length; i++)
+                {
+                    if (!streamedIndices.Contains(i))
+                    {
+                        await WriteDataFrameAsync(i, readRequests[i].Data, readRequests[i].Status, cancellationToken);
+                        streamedIndices.Add(i);
+                    }
+                }
+
+                await WriteEndFrameAsync(readRequests.Length, hadError: false, errorMessage: null, cancellationToken);
+            }
+
+            catch (Exception ex)
+            {
+                await WriteEndFrameAsync(streamedIndices.Count, hadError: true, errorMessage: ex.Message, cancellationToken);
+            }
         }
 
         // Add cancellation support?
@@ -390,8 +430,16 @@ public class RemoteCommunicator
         else
             throw new Exception($"Unknown method '{methodName}'.");
 
-        return (result, data, status);
+        return (result, payloads);
     }
+
+    private record RemoteReadRequest(
+        string OriginalResourceName,
+        CatalogItem CatalogItem);
+
+    private record RawPayload(
+        Memory<byte> Data,
+        Memory<byte> Status);
 
     private Task SetContextAsync<T>(
         IDataSource<T?> dataSource,
@@ -409,6 +457,64 @@ public class RemoteCommunicator
         );
 
         return dataSource.SetContextAsync(context, logger, cancellationToken);
+    }
+
+    private async Task WriteDataFrameAsync(
+        int index,
+        Memory<byte> data,
+        Memory<byte> status,
+        CancellationToken cancellationToken)
+    {
+        await _frameWriteLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            await _dataStream.WriteAsync(new byte[] { 0x01 }, cancellationToken);
+
+            var indexBuffer = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(indexBuffer, index);
+            await _dataStream.WriteAsync(indexBuffer, cancellationToken);
+
+            await _dataStream.WriteAsync(data, cancellationToken);
+            await _dataStream.WriteAsync(status, cancellationToken);
+            await _dataStream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _frameWriteLock.Release();
+        }
+    }
+
+    private async Task WriteEndFrameAsync(
+        int count,
+        bool hadError,
+        string? errorMessage,
+        CancellationToken cancellationToken)
+    {
+        await _frameWriteLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            await _dataStream.WriteAsync(new byte[] { 0x03 }, cancellationToken);
+
+            var countBuffer = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(countBuffer, count);
+            await _dataStream.WriteAsync(countBuffer, cancellationToken);
+
+            await _dataStream.WriteAsync(new byte[] { hadError ? (byte)1 : (byte)0 }, cancellationToken);
+
+            var msgBytes = Encoding.UTF8.GetBytes(errorMessage ?? "");
+            var msgLenBuffer = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(msgLenBuffer, msgBytes.Length);
+            await _dataStream.WriteAsync(msgLenBuffer, cancellationToken);
+            await _dataStream.WriteAsync(msgBytes, cancellationToken);
+
+            await _dataStream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _frameWriteLock.Release();
+        }
     }
 
     private async Task HandleReadDataAsync(

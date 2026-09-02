@@ -1,4 +1,5 @@
-﻿using System.Net.Sockets;
+﻿using System.Buffers.Binary;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using StreamJsonRpc;
@@ -93,6 +94,26 @@ internal class RemoteCommunicator : IDisposable
         return _dataStream.ReadExactlyAsync(buffer, cancellationToken);
     }
 
+    public async Task<byte> ReadByteAsync(CancellationToken cancellationToken)
+    {
+        if (_dataStream is null)
+            throw new Exception("You need to connect before read any data");
+
+        byte[] buffer = new byte[1];
+        await _dataStream.ReadExactlyAsync(buffer, cancellationToken);
+        return buffer[0];
+    }
+
+    public async Task<int> ReadInt32BigEndianAsync(CancellationToken cancellationToken)
+    {
+        if (_dataStream is null)
+            throw new Exception("You need to connect before read any data");
+
+        byte[] buffer = new byte[4];
+        await _dataStream.ReadExactlyAsync(buffer, cancellationToken);
+        return BinaryPrimitives.ReadInt32BigEndian(buffer);
+    }
+
     public Task WriteRawAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
     {
         if (_dataStream is null)
@@ -107,7 +128,8 @@ internal class RemoteCommunicator : IDisposable
         CancellationToken cancellationToken
     )
     {
-        var length = BitConverter.GetBytes(buffer.Length).Reverse().ToArray();
+        var length = BitConverter.GetBytes(buffer.Length);
+        Array.Reverse(length);
 
         await target.WriteAsync(length, cancellationToken);
         await target.WriteAsync(buffer, cancellationToken);

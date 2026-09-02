@@ -4,6 +4,7 @@ using Nexus.DataModel;
 using Nexus.Extensibility;
 using System.Buffers;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -25,7 +26,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
     private ReadDataHandler? _readData;
 
-    private static readonly int API_LEVEL = 1;
+    private Dictionary<string, int>? _inFlightRequests;
 
     private RemoteCommunicator _communicator = default!;
     
@@ -184,24 +185,77 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
         try
         {
-            var counter = 0.0;
+            var remoteRequests = requests
+                .Select(request => new RemoteReadRequest(request.OriginalResourceName, request.CatalogItem))
+                .ToArray();
 
-            foreach (var (originalResourceName, catalogItem, data, status) in requests)
+            _inFlightRequests = new Dictionary<string, int>(requests.Length);
+
+            for (int i = 0; i < requests.Length; i++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                var resourcePath = $"{requests[i].CatalogItem.Catalog.Id}/{requests[i].OriginalResourceName}/{requests[i].CatalogItem.Representation.SamplePeriod.ToUnitString()}";
+                _inFlightRequests[resourcePath] = i;
+            }
 
-                var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(1));
-                cancellationToken.Register(timeoutTokenSource.Cancel);
+            try
+            {
+                var rpcTask = _rpcServer.ReadAsync(begin, end, remoteRequests, cancellationToken);
 
-                var elementCount = data.Length / catalogItem.Representation.ElementSize;
+                var counter = 0.0;
 
-                await _rpcServer
-                    .ReadSingleAsync(begin, end, originalResourceName, catalogItem, timeoutTokenSource.Token);
+                while (true)
+                {
+                    var frameType = await _communicator.ReadByteAsync(cancellationToken);
 
-                await _communicator.ReadRawAsync(data, timeoutTokenSource.Token);
-                await _communicator.ReadRawAsync(status, timeoutTokenSource.Token);
+                    if (frameType == 0x01) // Data
+                    {
+                        var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        await _communicator.ReadRawAsync(requests[index].Data, cancellationToken);
+                        await _communicator.ReadRawAsync(requests[index].Status, cancellationToken);
+                        await requests[index].CompleteAsync(cancellationToken);
+                        progress.Report(++counter / requests.Length);
+                    }
 
-                progress.Report(++counter / requests.Length);
+                    else if (frameType == 0x02) // Error
+                    {
+                        var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var msgLen = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var msgBytes = new byte[msgLen];
+                        await _communicator.ReadRawAsync(msgBytes, cancellationToken);
+                        requests[index].Data.Span.Clear();
+                        requests[index].Status.Span.Clear();
+                        await requests[index].CompleteAsync(cancellationToken);
+                        progress.Report(++counter / requests.Length);
+                    }
+
+                    else if (frameType == 0x03) // End
+                    {
+                        var count = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var hadError = await _communicator.ReadByteAsync(cancellationToken);
+                        var msgLen = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var msgBytes = new byte[msgLen];
+                        await _communicator.ReadRawAsync(msgBytes, cancellationToken);
+                        var errorMsg = Encoding.UTF8.GetString(msgBytes);
+
+                        await rpcTask;
+
+                        if (hadError != 0)
+                            throw new RemoteException(string.IsNullOrEmpty(errorMsg)
+                                ? "The remote read operation failed."
+                                : errorMsg);
+
+                        break;
+                    }
+
+                    else
+                    {
+                        throw new Exception($"Unknown frame type '{frameType}'.");
+                    }
+                }
+            }
+            finally
+            {
+                _inFlightRequests = null;
             }
         }
         finally
@@ -238,10 +292,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         cancellationToken.Register(timeoutTokenSource.Cancel);
 
         var rpcServer = await communicator.ConnectAsync(timeoutTokenSource.Token);
-        var apiVersion = await rpcServer.InitializeAsync(remoteType, timeoutTokenSource.Token);
-
-        if (apiVersion < 1 || apiVersion > API_LEVEL)
-            throw new Exception($"The API level '{apiVersion}' is not supported.");
+        await rpcServer.InitializeAsync(remoteType, timeoutTokenSource.Token);
 
         return (communicator, rpcServer);
     }
@@ -256,6 +307,10 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
     private async Task HandleReadDataAsync(string resourcePath, DateTime begin, DateTime end)
     {
+        // cycle detection
+        if (_inFlightRequests is not null && _inFlightRequests.ContainsKey(resourcePath))
+            throw new RemoteException("Cyclic read detected.");
+
         // copy of _readData handler
         var localReadData = _readData ?? throw new InvalidOperationException("Unable to read data without previous invocation of the ReadAsync method.");
 

@@ -130,7 +130,7 @@ public class RemoteTestsFixture : IDisposable
     {
         var psi_run = new ProcessStartInfo("bash")
         {
-            Arguments = $"-c \"source ../../../.venv/bin/activate; fastapi run main.py\"",
+            Arguments = $"-c \"source ../../../.venv/bin/activate; fastapi run main.py --port 60002\"",
             WorkingDirectory="../../../../src/agent/python",
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -139,6 +139,7 @@ public class RemoteTestsFixture : IDisposable
 
         psi_run.Environment["PYTHONPATH"] = "../../remoting/python";
         psi_run.Environment["NEXUSAGENT_PATHS__CONFIG"] = "../../../.nexus-agent-python/config";
+        psi_run.Environment["NEXUSAGENT_PATHS__PACKAGES"] = "../../../.nexus-agent-python/packages";
         psi_run.Environment["NEXUSAGENT_SYSTEM__JSONRPCLISTENPORT"] = "60001";
 
         _runProcess_python = new Process
@@ -163,6 +164,12 @@ public class RemoteTestsFixture : IDisposable
         _runProcess_python.ErrorDataReceived += (sender, e) =>
         {
             // File.AppendAllText("/home/vincent/Downloads/error.txt", e.Data + Environment.NewLine);
+
+            if (e.Data is not null && e.Data.Contains("Application startup complete."))
+            {
+                success = true;
+                _semaphoreRun.Release();
+            }
 
             if (e.Data is not null && e.Data.ToLower().Contains("error"))
             {

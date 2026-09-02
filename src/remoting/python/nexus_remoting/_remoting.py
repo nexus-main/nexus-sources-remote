@@ -49,6 +49,7 @@ class RemoteCommunicator:
     _logger: ILogger
     _source_type_name: str
     _data_source: IDataSource
+    _frame_write_lock: asyncio.Lock
 
     def __init__(
         self, 
@@ -72,6 +73,7 @@ class RemoteCommunicator:
         self._data_reader = data_reader
         self._data_writer = data_writer
         self._get_data_source_type = get_data_source_type
+        self._frame_write_lock = asyncio.Lock()
 
     @property
     def last_communication(self) -> timedelta:
@@ -95,8 +97,7 @@ class RemoteCommunicator:
             request: Dict[str, Any] = json.loads(json_request)
 
             # process message
-            data: Optional[object] = None
-            status: Optional[memoryview] = None
+            payloads: list[tuple[memoryview, memoryview]] = []
             response: Optional[Dict[str, Any]]
 
             if "jsonrpc" in request and request["jsonrpc"] == "2.0":
@@ -105,7 +106,7 @@ class RemoteCommunicator:
 
                     try:
 
-                        (result, data, status) = await self._process_invocation(request)
+                        (result, payloads) = await self._process_invocation(request)
 
                         response = {
                             "result": result
@@ -133,31 +134,29 @@ class RemoteCommunicator:
             await _send_to_server(response, self._comm_writer)
 
             # send data
-            if data is not None and status is not None:
+            if len(payloads) > 0:
 
-                self._data_writer.write(data)
-                self._data_writer.write(status)
+                for (data, status) in payloads:
+                    self._data_writer.write(data)
+                    self._data_writer.write(status)
 
                 await self._data_writer.drain()
 
     async def _process_invocation(self, request: dict[str, Any]) \
         -> Tuple[
             Optional[Any], 
-            Optional[memoryview], 
-            Optional[memoryview]
+            list[tuple[memoryview, memoryview]]
         ]:
         
         result: Optional[Any] = None
-        data: Optional[memoryview] = None
-        status: Optional[memoryview] = None
+        payloads: list[tuple[memoryview, memoryview]] = []
 
         method_name = request["method"]
         params = cast(list[Any], request["params"])
 
         if method_name == "initialize":
-            
+
             self._source_type_name = params[0]
-            result = 1 # API version
 
         elif method_name == "upgradeSourceConfiguration":
 
@@ -256,24 +255,49 @@ class RemoteCommunicator:
 
             result = availability
 
-        elif method_name == "readSingle":
+        elif method_name == "read":
 
             if self._data_source is None:
                 raise Exception("The data source context must be set before invoking other methods.")
 
             begin = _json_encoder_options.decoders[datetime](datetime, params[0])
             end = _json_encoder_options.decoders[datetime](datetime, params[1])
-            original_resource_name = params[2]
-            catalog_item = JsonEncoder.decode(CatalogItem, params[3], _json_encoder_options)
-            (data, status) = ExtensibilityUtilities.create_buffers(catalog_item.representation, begin, end)
-            read_request = ReadRequest(original_resource_name, catalog_item, data, status)
+            remote_read_requests = cast(list[Any], params[2])
+            read_requests: list[ReadRequest] = []
+            streamed_indices: set[int] = set()
 
-            await self._data_source.read(
-                begin, 
-                end, 
-                [read_request], 
-                self._handle_read_data, 
-                self._handle_report_progress)
+            for index, remote_read_request in enumerate(remote_read_requests):
+                original_resource_name = remote_read_request["originalResourceName"]
+                catalog_item = JsonEncoder.decode(CatalogItem, remote_read_request["catalogItem"], _json_encoder_options)
+                (data, status) = ExtensibilityUtilities.create_buffers(catalog_item.representation, begin, end)
+
+                def _make_callback(idx: int, d: memoryview, s: memoryview):
+                    async def on_completed():
+                        await self._write_data_frame(idx, d, s)
+                        streamed_indices.add(idx)
+                    return on_completed
+
+                on_completed = _make_callback(index, data, status)
+                read_requests.append(ReadRequest(original_resource_name, catalog_item, data, status, on_completed))
+
+            try:
+                await self._data_source.read(
+                    begin,
+                    end,
+                    read_requests,
+                    self._handle_read_data,
+                    self._handle_report_progress)
+
+                for i in range(len(read_requests)):
+                    if i not in streamed_indices:
+                        read_request = read_requests[i]
+                        await self._write_data_frame(i, read_request.data, read_request.status)
+                        streamed_indices.add(i)
+
+                await self._write_end_frame(len(read_requests), had_error=False, error_message=None)
+
+            except Exception as ex:
+                await self._write_end_frame(len(streamed_indices), had_error=True, error_message=str(ex))
 
         # Add cancellation support?
         # https://github.com/microsoft/vs-streamjsonrpc/blob/main/doc/sendrequest.md#cancellation
@@ -292,7 +316,35 @@ class RemoteCommunicator:
         else:
             raise Exception(f"Unknown method '{method_name}'.")
 
-        return (result, data, status)
+        return (result, payloads)
+
+    async def _write_data_frame(
+        self,
+        index: int,
+        data: memoryview,
+        status: memoryview
+    ):
+        async with self._frame_write_lock:
+            self._data_writer.write(struct.pack(">B", 0x01))
+            self._data_writer.write(struct.pack(">i", index))
+            self._data_writer.write(data)
+            self._data_writer.write(status)
+            await self._data_writer.drain()
+
+    async def _write_end_frame(
+        self,
+        count: int,
+        had_error: bool,
+        error_message: Optional[str]
+    ):
+        async with self._frame_write_lock:
+            self._data_writer.write(struct.pack(">B", 0x03))
+            self._data_writer.write(struct.pack(">i", count))
+            self._data_writer.write(struct.pack(">B", 1 if had_error else 0))
+            msg_bytes = (error_message or "").encode("utf-8")
+            self._data_writer.write(struct.pack(">i", len(msg_bytes)))
+            self._data_writer.write(msg_bytes)
+            await self._data_writer.drain()
 
     async def _handle_read_data(self, resource_path: str, begin: datetime, end: datetime) -> memoryview:
 

@@ -115,8 +115,14 @@ public class Test : TestBase, IDataSource<TestSettings>
                 .AddRepresentation(representation)
                 .Build();
 
+            var resource2 = new ResourceBuilder("resource2")
+                .WithUnit("m/s")
+                .WithGroups("group1")
+                .AddRepresentation(representation)
+                .Build();
+
             catalog = new ResourceCatalogBuilder("/D/E/F")
-                .AddResource(resource)
+                .AddResources(resource, resource2)
                 .Build();
         }
 
@@ -248,6 +254,8 @@ public class Test : TestBase, IDataSource<TestSettings>
 
                 currentBegin += TimeSpan.FromDays(1);
             }
+
+            await request.CompleteAsync(cancellationToken);
         }
     }
 
@@ -280,7 +288,10 @@ public class Test : TestBase, IDataSource<TestSettings>
             var buffer = memoryOwner.Memory.Slice(0, length);
 
             await readData("/need/more/data/1_s", begin, end, buffer, cancellationToken);
-            GenerateData(request, buffer.Span);    
+            GenerateData(request, buffer.Span);
+            request.Status.Span[0] = (byte)requests.Length;
+
+            await request.CompleteAsync(cancellationToken);
         }
     }
 }

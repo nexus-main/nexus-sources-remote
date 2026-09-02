@@ -9,7 +9,7 @@ namespace Nexus.Sources;
 
 internal interface IJsonRpcServer : IDataSource<JsonElement>
 {
-    public Task<int> InitializeAsync(
+    public Task InitializeAsync(
         string type,
         CancellationToken cancellationToken
     );
@@ -24,14 +24,17 @@ internal interface IJsonRpcServer : IDataSource<JsonElement>
         CancellationToken cancellationToken
     );
 
-    public Task ReadSingleAsync(
-        DateTime begin, 
-        DateTime end, 
-        string originalResourceName, 
-        CatalogItem catalogItem, 
+    public Task ReadAsync(
+        DateTime begin,
+        DateTime end,
+        RemoteReadRequest[] requests,
         CancellationToken cancellationToken
     );
 }
+
+internal record RemoteReadRequest(
+    string OriginalResourceName,
+    CatalogItem CatalogItem);
 
 internal record LogMessage(LogLevel LogLevel, string Message);
 

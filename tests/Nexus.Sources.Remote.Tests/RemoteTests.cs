@@ -177,7 +177,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
         GenerateData(new DateTimeOffset(2020, 01, 02, 09, 40, 0, 0, TimeSpan.Zero));
         GenerateData(new DateTimeOffset(2020, 01, 02, 09, 50, 0, 0, TimeSpan.Zero));
 
-        var request = new ReadRequest(resource.Id, catalogItem, data, status);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
         await dataSource.ReadAsync(begin, end, [request], default!, new Progress<double>(), CancellationToken.None);
         var longData = new CastMemoryManager<byte, long>(data).Memory;
 
@@ -211,7 +211,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
             default);
 
         var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
-        var request = new ReadRequest(resource.Id, catalogItem, data, status);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
 
         // Act
         await dataSource.ReadAsync(
@@ -302,12 +302,124 @@ public class RemoteTests(RemoteTestsFixture fixture)
             return Task.CompletedTask;
         }
 
-        var request = new ReadRequest(resource.Id, catalogItem, data, status);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
         await dataSource.ReadAsync(begin, end, [request], HandleReadDataAsync, new Progress<double>(), CancellationToken.None);
         var doubleData = new CastMemoryManager<byte, double>(data).Memory;
 
         Assert.True(expectedData.SequenceEqual(doubleData.ToArray()));
         Assert.True(expectedStatus.SequenceEqual(status.ToArray()));
+    }
+
+    [Theory]
+    [InlineData(DOTNET)]
+    [InlineData(PYTHON)]
+    public async Task CanReadBatch(string language)
+    {
+        await _fixture.Initialize;
+
+        var dataSource = new Remote() as IDataSource<RemoteSettings>;
+        var context = CreateContext(language);
+
+        await dataSource.SetContextAsync(context, NullLogger.Instance, CancellationToken.None);
+
+        var catalog = await dataSource.EnrichCatalogAsync(new ResourceCatalog("/D/E/F"), CancellationToken.None);
+        var begin = new DateTime(2020, 01, 01, 0, 0, 0, DateTimeKind.Utc);
+        var end = new DateTime(2020, 01, 01, 0, 1, 0, DateTimeKind.Utc);
+        var requests = catalog.Resources!
+            .Select(resource =>
+            {
+                var representation = resource.Representations![0];
+                var catalogItem = new CatalogItem(
+                    catalog with { Resources = default! },
+                    resource with { Representations = default! },
+                    representation,
+                    default);
+                var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
+
+                return new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+            })
+            .ToArray();
+
+        Task HandleReadDataAsync(string resourcePath, DateTime begin, DateTime end, Memory<double> buffer, CancellationToken cancellationToken)
+        {
+            var data = Enumerable
+                .Range(0, buffer.Length)
+                .Select(value => (double)value)
+                .ToArray();
+
+            data.CopyTo(buffer);
+
+            return Task.CompletedTask;
+        }
+
+        await dataSource.ReadAsync(begin, end, requests, HandleReadDataAsync, new Progress<double>(), CancellationToken.None);
+
+        Assert.Equal(2, requests.Length);
+
+
+        foreach (var request in requests)
+        {
+            var doubleData = new CastMemoryManager<byte, double>(request.Data).Memory;
+            var expectedData = Enumerable
+                .Range(0, doubleData.Length)
+                .Select(value => (double)value * 2)
+                .ToArray();
+
+            Assert.True(expectedData.SequenceEqual(doubleData.ToArray()));
+            Assert.Equal(2, request.Status.Span[0]);
+            Assert.All(request.Status.ToArray()[1..], value => Assert.Equal(1, value));
+        }
+    }
+
+    [Theory]
+    [InlineData(DOTNET)]
+    [InlineData(PYTHON)]
+    public async Task CanReadBatchStreamed(string language)
+    {
+        await _fixture.Initialize;
+
+        var dataSource = new Remote() as IDataSource<RemoteSettings>;
+        var context = CreateContext(language);
+
+        await dataSource.SetContextAsync(context, NullLogger.Instance, CancellationToken.None);
+
+        var catalog = await dataSource.EnrichCatalogAsync(new ResourceCatalog("/A/B/C"), CancellationToken.None);
+
+        var begin = new DateTime(2019, 12, 31, 12, 0, 0, DateTimeKind.Utc);
+        var end = new DateTime(2019, 12, 31, 12, 10, 0, DateTimeKind.Utc);
+
+        var requests = catalog.Resources!
+            .Select(resource =>
+            {
+                var representation = resource.Representations![0];
+                var catalogItem = new CatalogItem(
+                    catalog with { Resources = default! },
+                    resource with { Representations = default! },
+                    representation,
+                    default);
+                var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
+
+                return new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+            })
+            .ToArray();
+
+        await dataSource.ReadAsync(begin, end, requests, default!, new Progress<double>(), CancellationToken.None);
+
+        Assert.Equal(2, requests.Length);
+
+        var expectedLength = 10 * 60;
+        var expectedData = new long[expectedLength];
+        var expectedStatus = new byte[expectedLength];
+
+        for (int i = 0; i < expectedLength; i++)
+        {
+            expectedData[i] = new DateTimeOffset(begin).Add(TimeSpan.FromSeconds(i)).ToUnixTimeSeconds();
+            expectedStatus[i] = 1;
+        }
+
+        var longData = new CastMemoryManager<byte, long>(requests[0].Data).Memory;
+        Assert.True(expectedData.SequenceEqual(longData.ToArray()));
+        Assert.True(expectedStatus.SequenceEqual(requests[0].Status.ToArray()));
     }
 
     private static DataSourceContext<RemoteSettings> CreateContext(string language)

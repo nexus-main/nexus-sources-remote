@@ -5,6 +5,8 @@
     "tests/remoting/python-tests",
     "tests/Nexus.Sources.Remote.Tests/python"
   ],
+  "venvPath": ".",
+  "venv": ".venv",
   "stubPath": "",
   "executionEnvironments":[
     {
