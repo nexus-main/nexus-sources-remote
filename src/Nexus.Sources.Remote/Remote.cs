@@ -23,6 +23,7 @@ public record RemoteSettings(
 public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource, IDisposable
 {
     private const int DEFAULT_AGENT_PORT = 56145;
+    private const int MAX_ERROR_MESSAGE_LENGTH = 64 * 1024;
 
     private ReadDataHandler? _readData;
 
@@ -210,6 +211,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                     if (frameType == 0x01) // Data
                     {
                         var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        ValidateFrameIndex(index, requests.Length);
                         await _communicator.ReadRawAsync(requests[index].Data, cancellationToken);
                         await _communicator.ReadRawAsync(requests[index].Status, cancellationToken);
                         await requests[index].CompleteAsync(cancellationToken);
@@ -219,7 +221,8 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                     else if (frameType == 0x02) // Error
                     {
                         var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
-                        var msgLen = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        ValidateFrameIndex(index, requests.Length);
+                        var msgLen = await ReadErrorMessageLengthAsync(cancellationToken);
                         var msgBytes = new byte[msgLen];
                         await _communicator.ReadRawAsync(msgBytes, cancellationToken);
                         requests[index].Data.Span.Clear();
@@ -231,8 +234,12 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                     else if (frameType == 0x03) // End
                     {
                         var count = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+
+                        if (count != requests.Length)
+                            throw new RemoteException("The remote read operation completed with an invalid result count.");
+
                         var hadError = await _communicator.ReadByteAsync(cancellationToken);
-                        var msgLen = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var msgLen = await ReadErrorMessageLengthAsync(cancellationToken);
                         var msgBytes = new byte[msgLen];
                         await _communicator.ReadRawAsync(msgBytes, cancellationToken);
                         var errorMsg = Encoding.UTF8.GetString(msgBytes);
@@ -262,6 +269,22 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         {
             _readData = null;
         }
+    }
+
+    private static void ValidateFrameIndex(int index, int requestCount)
+    {
+        if (index < 0 || index >= requestCount)
+            throw new RemoteException("The remote read operation returned an invalid resource index.");
+    }
+
+    private async Task<int> ReadErrorMessageLengthAsync(CancellationToken cancellationToken)
+    {
+        var messageLength = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+
+        if (messageLength < 0 || messageLength > MAX_ERROR_MESSAGE_LENGTH)
+            throw new RemoteException("The remote read operation returned an invalid error message length.");
+
+        return messageLength;
     }
 
     private static async Task<(RemoteCommunicator, IJsonRpcServer)> CreateRemoteCommunicatorAsync(
