@@ -1,5 +1,6 @@
 .vs/
 .venv/
+.nexus-agent-python/packages/
 
 artifacts/
 BenchmarkDotNet.Artifacts

@@ -214,7 +214,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                         ValidateFrameIndex(index, requests.Length);
                         await _communicator.ReadRawAsync(requests[index].Data, cancellationToken);
                         await _communicator.ReadRawAsync(requests[index].Status, cancellationToken);
-                        await requests[index].CompleteAsync(cancellationToken);
+                        await requests[index].CompleteAsync();
                         progress.Report(++counter / requests.Length);
                     }
 
@@ -227,7 +227,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                         await _communicator.ReadRawAsync(msgBytes, cancellationToken);
                         requests[index].Data.Span.Clear();
                         requests[index].Status.Span.Clear();
-                        await requests[index].CompleteAsync(cancellationToken);
+                        await requests[index].CompleteAsync();
                         progress.Report(++counter / requests.Length);
                     }
 

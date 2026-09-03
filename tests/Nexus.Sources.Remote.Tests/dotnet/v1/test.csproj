@@ -5,9 +5,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Nexus.Extensibility">
+    <ProjectReference Include="../../../../../nexus/src/extensibility/dotnet-extensibility/dotnet-extensibility.csproj">
       <ExcludeAssets>runtime;native</ExcludeAssets>
-    </PackageReference>
+    </ProjectReference>
   </ItemGroup>
 
 </Project>

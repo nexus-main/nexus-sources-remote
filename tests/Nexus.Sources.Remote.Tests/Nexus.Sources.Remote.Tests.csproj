@@ -11,7 +11,6 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="Moq" />
-    <PackageReference Include="Nexus.Extensibility" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
@@ -21,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Nexus.Sources.Remote/Nexus.Sources.Remote.csproj" />
+    <ProjectReference Include="../../../nexus/src/extensibility/dotnet-extensibility/dotnet-extensibility.csproj" />
   </ItemGroup>
   
   <ItemGroup>

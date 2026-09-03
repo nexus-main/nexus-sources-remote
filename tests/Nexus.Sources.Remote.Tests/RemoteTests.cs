@@ -34,8 +34,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanUpgradeSourceConfiguration(string language)
     {
-        await _fixture.Initialize;
-
         // Arrange
         var configuration = CreateSettings(language);
 
@@ -59,8 +57,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task ProvidesCatalog(string language)
     {
-        await _fixture.Initialize;
-        
         // Arrange
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
@@ -95,8 +91,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanProvideTimeRange(string language)
     {
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -116,8 +110,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanProvideAvailability(string language)
     {
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -135,8 +127,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanReadFullDay(string language)
     {
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -177,7 +167,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
         GenerateData(new DateTimeOffset(2020, 01, 02, 09, 40, 0, 0, TimeSpan.Zero));
         GenerateData(new DateTimeOffset(2020, 01, 02, 09, 50, 0, 0, TimeSpan.Zero));
 
-        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
         await dataSource.ReadAsync(begin, end, [request], default!, new Progress<double>(), CancellationToken.None);
         var longData = new CastMemoryManager<byte, long>(data).Memory;
 
@@ -191,8 +181,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     public async Task CanRoundtripDateTime(string language)
     {
         // Arrange
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -211,7 +199,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
             default);
 
         var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
-        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
 
         // Act
         await dataSource.ReadAsync(
@@ -229,8 +217,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanLog(string language)
     {
-        await _fixture.Initialize;
-
         var loggerMock = new Mock<ILogger>();
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
@@ -257,8 +243,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)] 
     public async Task CanReadDataHandler(string language)
     {
-        await _fixture.Initialize;
-        
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -302,7 +286,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
             return Task.CompletedTask;
         }
 
-        var request = new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+        var request = new ReadRequest(resource.Id, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
         await dataSource.ReadAsync(begin, end, [request], HandleReadDataAsync, new Progress<double>(), CancellationToken.None);
         var doubleData = new CastMemoryManager<byte, double>(data).Memory;
 
@@ -315,8 +299,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)]
     public async Task CanReadBatch(string language)
     {
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -336,7 +318,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
                     default);
                 var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
 
-                return new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+                return new ReadRequest(resource.Id, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
             })
             .ToArray();
 
@@ -376,8 +358,6 @@ public class RemoteTests(RemoteTestsFixture fixture)
     [InlineData(PYTHON)]
     public async Task CanReadBatchStreamed(string language)
     {
-        await _fixture.Initialize;
-
         var dataSource = new Remote() as IDataSource<RemoteSettings>;
         var context = CreateContext(language);
 
@@ -399,7 +379,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
                     default);
                 var (data, status) = ExtensibilityUtilities.CreateBuffers(representation, begin, end);
 
-                return new ReadRequest(resource.Id, catalogItem, data, status, OnCompleted: null);
+                return new ReadRequest(resource.Id, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
             })
             .ToArray();
 

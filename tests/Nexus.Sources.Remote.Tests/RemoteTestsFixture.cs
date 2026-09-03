@@ -1,8 +1,9 @@
 using System.Diagnostics;
+using Xunit;
 
 namespace Nexus.Sources.Tests;
 
-public class RemoteTestsFixture : IDisposable
+public class RemoteTestsFixture : IAsyncLifetime, IDisposable
 {
     private Process? _buildProcess_dotnet;
 
@@ -14,18 +15,21 @@ public class RemoteTestsFixture : IDisposable
 
     private readonly SemaphoreSlim _semaphoreRun = new(0, 1);
 
-    public RemoteTestsFixture()
-    {
-        Initialize = Task.Run(() =>
-        {
-            var dotnetTask = RunDotnetAgent();
-            var pythonTask = RunPythonAgent();
+    private bool _disposed;
 
-            return Task.WhenAll(dotnetTask, pythonTask);
-        });
+    public Task InitializeAsync()
+    {
+        var dotnetTask = RunDotnetAgent();
+        var pythonTask = RunPythonAgent();
+
+        return Task.WhenAll(dotnetTask, pythonTask);
     }
 
-    public Task Initialize { get; }
+    public Task DisposeAsync()
+    {
+        Dispose();
+        return Task.CompletedTask;
+    }
 
     private async Task RunDotnetAgent()
     {
@@ -193,8 +197,21 @@ public class RemoteTestsFixture : IDisposable
 
     public void Dispose()
     {
-        _buildProcess_dotnet?.Kill();
-        _runProcess_dotnet?.Kill();
-        _runProcess_python?.Kill();
+        if (_disposed)
+            return;
+
+        _disposed = true;
+
+        KillProcess(_buildProcess_dotnet);
+        KillProcess(_runProcess_dotnet);
+        KillProcess(_runProcess_python);
+    }
+
+    private static void KillProcess(Process? process)
+    {
+        if (process is null || process.HasExited)
+            return;
+
+        process.Kill();
     }
 }

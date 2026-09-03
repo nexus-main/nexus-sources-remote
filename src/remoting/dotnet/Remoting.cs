@@ -378,7 +378,8 @@ public class RemoteCommunicator
                     remoteReadRequests[i].CatalogItem,
                     data,
                     status,
-                    onCompleted);
+                    onCompleted,
+                    cancellationToken);
             }
 
             try

@@ -255,7 +255,7 @@ public class Test : TestBase, IDataSource<TestSettings>
                 currentBegin += TimeSpan.FromDays(1);
             }
 
-            await request.CompleteAsync(cancellationToken);
+            await request.CompleteAsync();
         }
     }
 
@@ -291,7 +291,7 @@ public class Test : TestBase, IDataSource<TestSettings>
             GenerateData(request, buffer.Span);
             request.Status.Span[0] = (byte)requests.Length;
 
-            await request.CompleteAsync(cancellationToken);
+            await request.CompleteAsync();
         }
     }
 }
