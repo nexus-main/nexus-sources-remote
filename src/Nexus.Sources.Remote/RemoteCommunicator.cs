@@ -24,12 +24,26 @@ internal class RemoteCommunicator : IDisposable
 
     private readonly ILogger _logger;
 
-    private readonly Func<string, DateTime, DateTime, Task> _readData;
+    private readonly Func<int, string, DateTime, DateTime, Task> _readData;
+
+    private readonly byte[] _byteBuffer = new byte[1];
+
+    private readonly byte[] _int32Buffer = new byte[4];
+
+    private readonly byte[] _readDataResponseDataFrameHeader = new byte[9];
+
+    private readonly byte[] _readDataResponseEndFrameHeader = new byte[5];
+
+    private readonly byte[] _readDataResponseErrorFrameHeader = new byte[9];
+
+    private bool _readDataResponseProtocolVersionWritten;
+
+    private readonly SemaphoreSlim _dataWriteLock = new(1, 1);
 
     public RemoteCommunicator(
         string host,
         int port,
-        Func<string, DateTime, DateTime, Task> readData,
+        Func<int, string, DateTime, DateTime, Task> readData,
         ILogger logger
     )
     {
@@ -99,41 +113,124 @@ internal class RemoteCommunicator : IDisposable
         if (_dataStream is null)
             throw new Exception("You need to connect before read any data");
 
-        byte[] buffer = new byte[1];
-        await _dataStream.ReadExactlyAsync(buffer, cancellationToken);
-        return buffer[0];
+        await _dataStream.ReadExactlyAsync(_byteBuffer, cancellationToken);
+        return _byteBuffer[0];
     }
 
-    public async Task<int> ReadInt32BigEndianAsync(CancellationToken cancellationToken)
+    public async Task<int> ReadInt32LittleEndianAsync(CancellationToken cancellationToken)
     {
         if (_dataStream is null)
             throw new Exception("You need to connect before read any data");
 
-        byte[] buffer = new byte[4];
-        await _dataStream.ReadExactlyAsync(buffer, cancellationToken);
-        return BinaryPrimitives.ReadInt32BigEndian(buffer);
+        await _dataStream.ReadExactlyAsync(_int32Buffer, cancellationToken);
+        return BinaryPrimitives.ReadInt32LittleEndian(_int32Buffer);
     }
 
-    public Task WriteRawAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
+    public Task WriteReadDataResponseAsync(
+        int requestId,
+        ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken)
     {
         if (_dataStream is null)
             throw new Exception("You need to connect before write any data");
 
-        return InternalWriteRawAsync(buffer, _dataStream, cancellationToken);
+        return InternalWriteReadDataResponseAsync(requestId, data, cancellationToken);
     }
 
-    private static async Task InternalWriteRawAsync(
-        ReadOnlyMemory<byte> buffer, 
-        Stream target, 
-        CancellationToken cancellationToken
-    )
+    public Task WriteReadDataResponseErrorAsync(
+        int requestId,
+        string message,
+        CancellationToken cancellationToken)
     {
-        var length = BitConverter.GetBytes(buffer.Length);
-        Array.Reverse(length);
+        if (_dataStream is null)
+            throw new Exception("You need to connect before write any data");
 
-        await target.WriteAsync(length, cancellationToken);
-        await target.WriteAsync(buffer, cancellationToken);
-        await target.FlushAsync(cancellationToken);
+        return InternalWriteReadDataResponseErrorAsync(requestId, message, cancellationToken);
+    }
+
+    public void ResetReadDataResponseProtocol()
+    {
+        _readDataResponseProtocolVersionWritten = false;
+    }
+
+    private async Task InternalWriteReadDataResponseAsync(
+        int requestId,
+        ReadOnlyMemory<byte> data,
+        CancellationToken cancellationToken)
+    {
+        await _dataWriteLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            await WriteReadDataResponseProtocolVersionAsync(cancellationToken);
+
+            var remainingData = data;
+
+            while (!remainingData.IsEmpty)
+            {
+                var payloadLength = Math.Min(remainingData.Length, Remote.MAX_BATCH_STREAM_PAYLOAD_LENGTH);
+
+                _readDataResponseDataFrameHeader[0] = 0x01;
+                BinaryPrimitives.WriteInt32LittleEndian(_readDataResponseDataFrameHeader.AsSpan(1), requestId);
+                BinaryPrimitives.WriteInt32LittleEndian(_readDataResponseDataFrameHeader.AsSpan(5), payloadLength);
+
+                await _dataStream!.WriteAsync(_readDataResponseDataFrameHeader, cancellationToken);
+                await _dataStream.WriteAsync(remainingData[..payloadLength], cancellationToken);
+                remainingData = remainingData[payloadLength..];
+            }
+
+            _readDataResponseEndFrameHeader[0] = 0x03;
+            BinaryPrimitives.WriteInt32LittleEndian(_readDataResponseEndFrameHeader.AsSpan(1), requestId);
+            await _dataStream!.WriteAsync(_readDataResponseEndFrameHeader, cancellationToken);
+            await _dataStream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _dataWriteLock.Release();
+        }
+    }
+
+    private async Task InternalWriteReadDataResponseErrorAsync(
+        int requestId,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        await _dataWriteLock.WaitAsync(cancellationToken);
+
+        try
+        {
+            await WriteReadDataResponseProtocolVersionAsync(cancellationToken);
+
+            var msgBytes = Encoding.UTF8.GetBytes(message);
+
+            if (msgBytes.Length > Remote.MAX_ERROR_MESSAGE_LENGTH)
+            {
+                while (Encoding.UTF8.GetByteCount(message) > Remote.MAX_ERROR_MESSAGE_LENGTH)
+                    message = message[..(message.Length - 1)];
+
+                msgBytes = Encoding.UTF8.GetBytes(message);
+            }
+
+            _readDataResponseErrorFrameHeader[0] = 0x02;
+            BinaryPrimitives.WriteInt32LittleEndian(_readDataResponseErrorFrameHeader.AsSpan(1), requestId);
+            BinaryPrimitives.WriteInt32LittleEndian(_readDataResponseErrorFrameHeader.AsSpan(5), msgBytes.Length);
+            await _dataStream!.WriteAsync(_readDataResponseErrorFrameHeader, cancellationToken);
+            await _dataStream.WriteAsync(msgBytes, cancellationToken);
+            await _dataStream.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _dataWriteLock.Release();
+        }
+    }
+
+    private async Task WriteReadDataResponseProtocolVersionAsync(CancellationToken cancellationToken)
+    {
+        if (_readDataResponseProtocolVersionWritten)
+            return;
+
+        await _dataStream!.WriteAsync(new[] { Remote.BATCH_STREAM_PROTOCOL_VERSION }, cancellationToken);
+        _readDataResponseProtocolVersionWritten = true;
     }
 
 #region IDisposable
@@ -151,6 +248,7 @@ internal class RemoteCommunicator : IDisposable
 
                 _commStream?.Dispose();
                 _dataStream?.Dispose();
+                _dataWriteLock.Dispose();
             }
 
             _disposedValue = true;

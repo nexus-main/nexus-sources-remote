@@ -4,7 +4,7 @@ import struct
 import time
 import typing
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, cast
 from urllib.parse import urlparse
 
 from nexus_extensibility import (CatalogItem, DataSourceContext,
@@ -22,6 +22,10 @@ _json_encoder_options: JsonEncoderOptions = JsonEncoderOptions(
 
 #                                                                                               zfill(26) ensures leading zeros when year is < 1000
 _json_encoder_options.encoders[datetime] = lambda value: value.strftime("%Y-%m-%dT%H:%M:%S.%f").zfill(26) + "0+00:00"
+
+_BATCH_STREAM_PROTOCOL_VERSION = 1
+_MAX_BATCH_STREAM_PAYLOAD_LENGTH = 4 * 1024 * 1024
+_MAX_BATCH_STREAM_ERROR_MESSAGE_LENGTH = 64 * 1024
 
 class _Logger(ILogger):
 
@@ -41,6 +45,35 @@ class _Logger(ILogger):
         task = asyncio.create_task(_send_to_server(notification, self._comm_writer))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+class _ReadDataResponseBuilder:
+
+    def __init__(self):
+        self._data = bytearray()
+        self.is_completed = False
+        self.error_message: Optional[str] = None
+
+    def add(self, data: bytes):
+        if self.is_completed:
+            raise Exception("The readData response received data after completion.")
+
+        self._data.extend(data)
+
+    def complete(self):
+        if self.is_completed:
+            raise Exception("The readData response completed more than once.")
+
+        self.is_completed = True
+
+    def fail(self, message: str):
+        if self.is_completed:
+            raise Exception("The readData response failed after completion.")
+
+        self.error_message = message
+        self.is_completed = True
+
+    def to_bytes(self) -> bytes:
+        return bytes(self._data)
 
 class RemoteCommunicator:
     """A remote communicator."""
@@ -74,6 +107,11 @@ class RemoteCommunicator:
         self._data_writer = data_writer
         self._get_data_source_type = get_data_source_type
         self._frame_write_lock = asyncio.Lock()
+        self._batch_stream_protocol_version_written = False
+        self._read_data_response_protocol_version_read = False
+        self._read_data_response_read_lock = asyncio.Lock()
+        self._read_data_request_id = 0
+        self._read_data_responses: dict[int, _ReadDataResponseBuilder] = {}
 
     @property
     def last_communication(self) -> timedelta:
@@ -97,7 +135,6 @@ class RemoteCommunicator:
             request: Dict[str, Any] = json.loads(json_request)
 
             # process message
-            payloads: list[tuple[memoryview, memoryview]] = []
             response: Optional[Dict[str, Any]]
 
             if "jsonrpc" in request and request["jsonrpc"] == "2.0":
@@ -106,7 +143,7 @@ class RemoteCommunicator:
 
                     try:
 
-                        (result, payloads) = await self._process_invocation(request)
+                        result = await self._process_invocation(request)
 
                         response = {
                             "result": result
@@ -133,23 +170,9 @@ class RemoteCommunicator:
             # send response
             await _send_to_server(response, self._comm_writer)
 
-            # send data
-            if len(payloads) > 0:
-
-                for (data, status) in payloads:
-                    self._data_writer.write(data)
-                    self._data_writer.write(status)
-
-                await self._data_writer.drain()
-
-    async def _process_invocation(self, request: dict[str, Any]) \
-        -> Tuple[
-            Optional[Any], 
-            list[tuple[memoryview, memoryview]]
-        ]:
+    async def _process_invocation(self, request: dict[str, Any]) -> Optional[Any]:
         
         result: Optional[Any] = None
-        payloads: list[tuple[memoryview, memoryview]] = []
 
         method_name = request["method"]
         params = cast(list[Any], request["params"])
@@ -263,8 +286,15 @@ class RemoteCommunicator:
             begin = _json_encoder_options.decoders[datetime](datetime, params[0])
             end = _json_encoder_options.decoders[datetime](datetime, params[1])
             remote_read_requests = cast(list[Any], params[2])
+
+            if len(remote_read_requests) > 256:
+                raise Exception("A remote batch read must not contain more than 256 resources.")
+
             read_requests: list[ReadRequest] = []
             streamed_indices: set[int] = set()
+            self._batch_stream_protocol_version_written = False
+            self._read_data_response_protocol_version_read = False
+            self._read_data_responses.clear()
 
             for index, remote_read_request in enumerate(remote_read_requests):
                 original_resource_name = remote_read_request["originalResourceName"]
@@ -294,10 +324,10 @@ class RemoteCommunicator:
                         await self._write_data_frame(i, read_request.data, read_request.status)
                         streamed_indices.add(i)
 
-                await self._write_end_frame(len(read_requests), had_error=False, error_message=None)
+                await self._write_end_frame()
 
             except Exception as ex:
-                await self._write_end_frame(len(streamed_indices), had_error=True, error_message=str(ex))
+                await self._write_error_frame(ex)
 
         # Add cancellation support?
         # https://github.com/microsoft/vs-streamjsonrpc/blob/main/doc/sendrequest.md#cancellation
@@ -316,7 +346,7 @@ class RemoteCommunicator:
         else:
             raise Exception(f"Unknown method '{method_name}'.")
 
-        return (result, payloads)
+        return result
 
     async def _write_data_frame(
         self,
@@ -325,35 +355,77 @@ class RemoteCommunicator:
         status: memoryview
     ):
         async with self._frame_write_lock:
-            self._data_writer.write(struct.pack(">B", 0x01))
-            self._data_writer.write(struct.pack(">i", index))
-            self._data_writer.write(data)
-            self._data_writer.write(status)
+            self._write_batch_stream_protocol_version()
+            self._write_payload_frames(index, data, status)
             await self._data_writer.drain()
 
-    async def _write_end_frame(
+    def _write_payload_frames(
         self,
-        count: int,
-        had_error: bool,
-        error_message: Optional[str]
+        index: int,
+        data: memoryview,
+        status: memoryview
     ):
+        data_offset = 0
+        status_offset = 0
+
+        while data_offset < len(data) or status_offset < len(status):
+            payload_length = min(
+                len(data) - data_offset + len(status) - status_offset,
+                _MAX_BATCH_STREAM_PAYLOAD_LENGTH)
+            remaining_payload_length = payload_length
+
+            self._data_writer.write(struct.pack("<BBi", 0x01, index, payload_length))
+
+            if data_offset < len(data):
+                data_byte_count = min(len(data) - data_offset, remaining_payload_length)
+                self._data_writer.write(data[data_offset:data_offset + data_byte_count])
+                data_offset += data_byte_count
+                remaining_payload_length -= data_byte_count
+
+            if remaining_payload_length > 0:
+                self._data_writer.write(status[status_offset:status_offset + remaining_payload_length])
+                status_offset += remaining_payload_length
+
+    async def _write_end_frame(self):
         async with self._frame_write_lock:
-            self._data_writer.write(struct.pack(">B", 0x03))
-            self._data_writer.write(struct.pack(">i", count))
-            self._data_writer.write(struct.pack(">B", 1 if had_error else 0))
-            msg_bytes = (error_message or "").encode("utf-8")
-            self._data_writer.write(struct.pack(">i", len(msg_bytes)))
+            self._write_batch_stream_protocol_version()
+            self._data_writer.write(struct.pack("B", 0x03))
+            await self._data_writer.drain()
+
+    async def _write_error_frame(self, exception: Exception):
+        async with self._frame_write_lock:
+            self._write_batch_stream_protocol_version()
+            msg_bytes = self._get_batch_stream_error_message(exception).encode("utf-8")
+            self._data_writer.write(struct.pack("<Bi", 0x02, len(msg_bytes)))
             self._data_writer.write(msg_bytes)
             await self._data_writer.drain()
+
+    def _write_batch_stream_protocol_version(self):
+        if self._batch_stream_protocol_version_written:
+            return
+
+        self._data_writer.write(struct.pack("B", _BATCH_STREAM_PROTOCOL_VERSION))
+        self._batch_stream_protocol_version_written = True
+
+    def _get_batch_stream_error_message(self, exception: Exception) -> str:
+        message = str(exception).strip() or "The remote batch stream failed."
+
+        while len(message.encode("utf-8")) > _MAX_BATCH_STREAM_ERROR_MESSAGE_LENGTH:
+            message = message[:-1]
+
+        return message
 
     async def _handle_read_data(self, resource_path: str, begin: datetime, end: datetime) -> memoryview:
 
         self._logger.log(LogLevel.Debug, f"Read resource path {resource_path} from Nexus")
+        self._read_data_request_id += 1
+        request_id = self._read_data_request_id
 
         read_data_request = {
             "jsonrpc": "2.0",
             "method": "readData",
             "params": [
+                request_id,
                 resource_path, 
                 begin, 
                 end
@@ -362,12 +434,75 @@ class RemoteCommunicator:
 
         await _send_to_server(read_data_request, self._comm_writer)
 
-        size = await self._read_size(self._data_reader)
-        data = await asyncio.wait_for(self._data_reader.readexactly(size), timeout=600)
+        data = await self._read_read_data_response(request_id)
 
         # 'cast' is required because of https://github.com/python/cpython/issues/126012
         # see also https://github.com/nexus-main/nexus/issues/184
         return cast(memoryview, memoryview(data).cast("d"))
+
+    async def _read_read_data_response(self, request_id: int) -> bytes:
+        async with self._read_data_response_read_lock:
+            while True:
+                completed_response = self._read_data_responses.get(request_id)
+
+                if completed_response is not None and completed_response.is_completed:
+                    del self._read_data_responses[request_id]
+
+                    if completed_response.error_message is not None:
+                        raise Exception(completed_response.error_message)
+
+                    return completed_response.to_bytes()
+
+                if not self._read_data_response_protocol_version_read:
+                    protocol_version_bytes = await asyncio.wait_for(self._data_reader.readexactly(1), timeout=60)
+                    protocol_version = struct.unpack("B", protocol_version_bytes)[0]
+
+                    if protocol_version != _BATCH_STREAM_PROTOCOL_VERSION:
+                        raise Exception(f"Unsupported readData response protocol version '{protocol_version}'.")
+
+                    self._read_data_response_protocol_version_read = True
+
+                frame_type_bytes = await asyncio.wait_for(self._data_reader.readexactly(1), timeout=60)
+                frame_type = struct.unpack("B", frame_type_bytes)[0]
+
+                request_id_bytes = await asyncio.wait_for(self._data_reader.readexactly(4), timeout=60)
+                frame_request_id = struct.unpack("<i", request_id_bytes)[0]
+                builder = self._get_read_data_response_builder(frame_request_id)
+
+                if frame_type == 0x01:
+                    payload_length_bytes = await asyncio.wait_for(self._data_reader.readexactly(4), timeout=60)
+                    payload_length = struct.unpack("<i", payload_length_bytes)[0]
+
+                    if payload_length <= 0 or payload_length > _MAX_BATCH_STREAM_PAYLOAD_LENGTH:
+                        raise Exception("The readData response returned an invalid payload length.")
+
+                    payload = await asyncio.wait_for(self._data_reader.readexactly(payload_length), timeout=600)
+                    builder.add(payload)
+
+                elif frame_type == 0x02:
+                    message_length_bytes = await asyncio.wait_for(self._data_reader.readexactly(4), timeout=60)
+                    message_length = struct.unpack("<i", message_length_bytes)[0]
+
+                    if message_length < 0 or message_length > _MAX_BATCH_STREAM_ERROR_MESSAGE_LENGTH:
+                        raise Exception("The readData response returned an invalid error message length.")
+
+                    message_bytes = await asyncio.wait_for(self._data_reader.readexactly(message_length), timeout=60)
+                    builder.fail(message_bytes.decode("utf-8"))
+
+                elif frame_type == 0x03:
+                    builder.complete()
+
+                else:
+                    raise Exception(f"Unknown readData response frame type '{frame_type}'.")
+
+    def _get_read_data_response_builder(self, request_id: int) -> _ReadDataResponseBuilder:
+        builder = self._read_data_responses.get(request_id)
+
+        if builder is None:
+            builder = _ReadDataResponseBuilder()
+            self._read_data_responses[request_id] = builder
+
+        return builder
 
     def _handle_report_progress(self, progress_value: float):
         pass # not implemented

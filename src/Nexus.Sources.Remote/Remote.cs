@@ -23,7 +23,9 @@ public record RemoteSettings(
 public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource, IDisposable
 {
     private const int DEFAULT_AGENT_PORT = 56145;
-    private const int MAX_ERROR_MESSAGE_LENGTH = 64 * 1024;
+    internal const byte BATCH_STREAM_PROTOCOL_VERSION = 1;
+    internal const int MAX_BATCH_STREAM_PAYLOAD_LENGTH = 4 * 1024 * 1024;
+    internal const int MAX_ERROR_MESSAGE_LENGTH = 64 * 1024;
 
     private ReadDataHandler? _readData;
 
@@ -63,7 +65,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         var (communicator, rpcServer) = await CreateRemoteCommunicatorAsync(
             thisConfiguration.RemoteUrl,
             thisConfiguration.RemoteType,
-            (_, _, _) => throw new Exception("This should never happen."),
+            (_, _, _, _) => throw new Exception("This should never happen."),
             NullLogger.Instance,
             cancellationToken
         );
@@ -200,56 +202,64 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
             try
             {
+                _communicator.ResetReadDataResponseProtocol();
                 var rpcTask = _rpcServer.ReadAsync(begin, end, remoteRequests, cancellationToken);
+                var protocolVersion = await ReadByteAsync(rpcTask, cancellationToken);
+
+                if (protocolVersion != BATCH_STREAM_PROTOCOL_VERSION)
+                    throw new RemoteException($"Unsupported remote batch stream protocol version '{protocolVersion}'.");
 
                 var counter = 0.0;
+                var completedRequests = new bool[requests.Length];
+                var receivedPayloadLengths = new int[requests.Length];
+
+                for (int i = 0; i < requests.Length; i++)
+                {
+                    if (GetExpectedPayloadLength(requests[i]) == 0)
+                    {
+                        completedRequests[i] = true;
+                        await requests[i].CompleteAsync();
+                        progress.Report(++counter / requests.Length);
+                    }
+                }
 
                 while (true)
                 {
-                    var frameType = await _communicator.ReadByteAsync(cancellationToken);
+                    var frameType = await ReadByteAsync(rpcTask, cancellationToken);
 
                     if (frameType == 0x01) // Data
                     {
-                        var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+                        var index = await _communicator.ReadByteAsync(cancellationToken);
                         ValidateFrameIndex(index, requests.Length);
-                        await _communicator.ReadRawAsync(requests[index].Data, cancellationToken);
-                        await _communicator.ReadRawAsync(requests[index].Status, cancellationToken);
-                        await requests[index].CompleteAsync();
-                        progress.Report(++counter / requests.Length);
+
+                        var payloadLength = await _communicator.ReadInt32LittleEndianAsync(cancellationToken);
+                        ValidatePayloadLength(payloadLength, requests[index], receivedPayloadLengths[index]);
+
+                        await ReadPayloadAsync(requests[index], receivedPayloadLengths[index], payloadLength, cancellationToken);
+                        receivedPayloadLengths[index] += payloadLength;
+
+                        if (!completedRequests[index] && receivedPayloadLengths[index] == GetExpectedPayloadLength(requests[index]))
+                        {
+                            completedRequests[index] = true;
+                            await requests[index].CompleteAsync();
+                            progress.Report(++counter / requests.Length);
+                        }
                     }
 
                     else if (frameType == 0x02) // Error
                     {
-                        var index = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
-                        ValidateFrameIndex(index, requests.Length);
                         var msgLen = await ReadErrorMessageLengthAsync(cancellationToken);
                         var msgBytes = new byte[msgLen];
                         await _communicator.ReadRawAsync(msgBytes, cancellationToken);
-                        requests[index].Data.Span.Clear();
-                        requests[index].Status.Span.Clear();
-                        await requests[index].CompleteAsync();
-                        progress.Report(++counter / requests.Length);
+                        throw new RemoteException(Encoding.UTF8.GetString(msgBytes));
                     }
 
                     else if (frameType == 0x03) // End
                     {
-                        var count = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
-
-                        if (count != requests.Length)
-                            throw new RemoteException("The remote read operation completed with an invalid result count.");
-
-                        var hadError = await _communicator.ReadByteAsync(cancellationToken);
-                        var msgLen = await ReadErrorMessageLengthAsync(cancellationToken);
-                        var msgBytes = new byte[msgLen];
-                        await _communicator.ReadRawAsync(msgBytes, cancellationToken);
-                        var errorMsg = Encoding.UTF8.GetString(msgBytes);
-
                         await rpcTask;
 
-                        if (hadError != 0)
-                            throw new RemoteException(string.IsNullOrEmpty(errorMsg)
-                                ? "The remote read operation failed."
-                                : errorMsg);
+                        if (completedRequests.Any(completedRequest => !completedRequest))
+                            throw new RemoteException("The remote read operation completed before all resources were received.");
 
                         break;
                     }
@@ -279,7 +289,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
     private async Task<int> ReadErrorMessageLengthAsync(CancellationToken cancellationToken)
     {
-        var messageLength = await _communicator.ReadInt32BigEndianAsync(cancellationToken);
+        var messageLength = await _communicator.ReadInt32LittleEndianAsync(cancellationToken);
 
         if (messageLength < 0 || messageLength > MAX_ERROR_MESSAGE_LENGTH)
             throw new RemoteException("The remote read operation returned an invalid error message length.");
@@ -287,10 +297,64 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         return messageLength;
     }
 
+    private async Task<byte> ReadByteAsync(Task rpcTask, CancellationToken cancellationToken)
+    {
+        var readTask = _communicator.ReadByteAsync(cancellationToken);
+#pragma warning disable VSTHRD003 // Intentionally race the RPC task to surface remote failures before waiting for data.
+        var completedTask = await Task.WhenAny(readTask, rpcTask).ConfigureAwait(false);
+
+        if (completedTask == rpcTask)
+            await rpcTask.ConfigureAwait(false);
+
+        return await readTask.ConfigureAwait(false);
+#pragma warning restore VSTHRD003
+    }
+
+    private async Task ReadPayloadAsync(
+        ReadRequest request,
+        int payloadOffset,
+        int payloadLength,
+        CancellationToken cancellationToken)
+    {
+        var dataLength = request.Data.Length;
+        var remainingPayloadLength = payloadLength;
+        var currentPayloadOffset = payloadOffset;
+
+        if (currentPayloadOffset < dataLength)
+        {
+            var dataByteCount = Math.Min(dataLength - currentPayloadOffset, remainingPayloadLength);
+            await _communicator.ReadRawAsync(request.Data.Slice(currentPayloadOffset, dataByteCount), cancellationToken);
+            currentPayloadOffset += dataByteCount;
+            remainingPayloadLength -= dataByteCount;
+        }
+
+        if (remainingPayloadLength > 0)
+        {
+            var statusOffset = currentPayloadOffset - dataLength;
+            await _communicator.ReadRawAsync(request.Status.Slice(statusOffset, remainingPayloadLength), cancellationToken);
+        }
+    }
+
+    private static void ValidatePayloadLength(int payloadLength, ReadRequest request, int receivedPayloadLength)
+    {
+        var expectedLength = GetExpectedPayloadLength(request);
+
+        if (payloadLength <= 0 || payloadLength > MAX_BATCH_STREAM_PAYLOAD_LENGTH)
+            throw new RemoteException("The remote read operation returned an invalid payload length.");
+
+        if (payloadLength > expectedLength - receivedPayloadLength)
+            throw new RemoteException("The remote read operation returned a payload with an unexpected length.");
+    }
+
+    private static int GetExpectedPayloadLength(ReadRequest request)
+    {
+        return request.Data.Length + request.Status.Length;
+    }
+
     private static async Task<(RemoteCommunicator, IJsonRpcServer)> CreateRemoteCommunicatorAsync(
         Uri remoteUrl,
         string remoteType,
-        Func<string, DateTime, DateTime, Task> readData,
+        Func<int, string, DateTime, DateTime, Task> readData,
         ILogger logger,
         CancellationToken cancellationToken
     )
@@ -328,40 +392,46 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
     private static readonly MethodInfo _toSamplePeriodMethodInfo = typeof(DataModelExtensions)
         .GetMethod("ToSamplePeriod", BindingFlags.Static | BindingFlags.NonPublic) ?? throw new Exception("Unable to locate ToSamplePeriod method.");
 
-    private async Task HandleReadDataAsync(string resourcePath, DateTime begin, DateTime end)
+    private async Task HandleReadDataAsync(int requestId, string resourcePath, DateTime begin, DateTime end)
     {
-        // cycle detection
-        if (_inFlightRequests is not null && _inFlightRequests.ContainsKey(resourcePath))
-            throw new RemoteException("Cyclic read detected.");
-
-        // copy of _readData handler
-        var localReadData = _readData ?? throw new InvalidOperationException("Unable to read data without previous invocation of the ReadAsync method.");
-
-        // timeout token source
         var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(1));
 
-        // find sample period
-        var match = ResourcePathEvaluator.Match(resourcePath);
+        try
+        {
+            // cycle detection
+            if (_inFlightRequests is not null && _inFlightRequests.ContainsKey(resourcePath))
+                throw new RemoteException("Cyclic read detected.");
 
-        if (!match.Success)
-            throw new Exception("Invalid resource path");
+            // copy of _readData handler
+            var localReadData = _readData ?? throw new InvalidOperationException("Unable to read data without previous invocation of the ReadAsync method.");
 
-        var samplePeriod = (TimeSpan)_toSamplePeriodMethodInfo.Invoke(null, [
-            match.Groups["sample_period"].Value
-        ])!;
+            // find sample period
+            var match = ResourcePathEvaluator.Match(resourcePath);
 
-        // find buffer length and rent buffer
-        var length = (int)((end - begin).Ticks / samplePeriod.Ticks);
+            if (!match.Success)
+                throw new Exception("Invalid resource path");
 
-        using var memoryOwner = MemoryPool<double>.Shared.Rent(length);
-        var buffer = memoryOwner.Memory[..length];
+            var samplePeriod = (TimeSpan)_toSamplePeriodMethodInfo.Invoke(null, [
+                match.Groups["sample_period"].Value
+            ])!;
 
-        // read data
-        await localReadData(resourcePath, begin, end, buffer, timeoutTokenSource.Token);
-        var byteBuffer = new CastMemoryManager<double, byte>(buffer).Memory;
+            // find buffer length and rent buffer
+            var length = (int)((end - begin).Ticks / samplePeriod.Ticks);
 
-        // write to communicator
-        await _communicator.WriteRawAsync(byteBuffer, timeoutTokenSource.Token);
+            using var memoryOwner = MemoryPool<double>.Shared.Rent(length);
+            var buffer = memoryOwner.Memory[..length];
+
+            // read data
+            await localReadData(resourcePath, begin, end, buffer, timeoutTokenSource.Token);
+            var byteBuffer = new CastMemoryManager<double, byte>(buffer).Memory;
+
+            // write to communicator
+            await _communicator.WriteReadDataResponseAsync(requestId, byteBuffer, timeoutTokenSource.Token);
+        }
+        catch (Exception ex)
+        {
+            await _communicator.WriteReadDataResponseErrorAsync(requestId, ex.Message, timeoutTokenSource.Token);
+        }
     }
 
     #region IDisposable

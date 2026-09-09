@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import asyncio
 import glob
 import os
 from dataclasses import dataclass
@@ -231,7 +232,7 @@ class Test(TestBase, IDataSource[TestSettings]):
         read_data: ReadDataHandler,
         report_progress: Callable[[float], None]):
         
-        for request in requests:
+        async def handle_request(request: ReadRequest):
             data_from_nexus = await read_data("/need/more/data/1_s", begin, end)
             double_data = request.data.cast("d")
 
@@ -244,3 +245,5 @@ class Test(TestBase, IDataSource[TestSettings]):
             request.status[0] = len(requests)
 
             await request.complete()
+
+        await asyncio.gather(*(handle_request(request) for request in requests))

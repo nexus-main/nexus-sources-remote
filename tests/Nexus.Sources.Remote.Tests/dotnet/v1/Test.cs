@@ -280,7 +280,7 @@ public class Test : TestBase, IDataSource<TestSettings>
             request.Status.Span.Fill(1);
         }
 
-        foreach (var request in requests)
+        async Task HandleRequestAsync(ReadRequest request)
         {
             var length = (int)((end - begin).Ticks / request.CatalogItem.Representation.SamplePeriod.Ticks);
 
@@ -293,5 +293,7 @@ public class Test : TestBase, IDataSource<TestSettings>
 
             await request.CompleteAsync();
         }
+
+        await Task.WhenAll(requests.Select(HandleRequestAsync));
     }
 }
