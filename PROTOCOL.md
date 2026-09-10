@@ -2,7 +2,7 @@
 
 The remote source protocol uses two TCP connections per client session: `comm` and `data`.
 
-The `comm` channel carries length-prefixed JSON-RPC messages. The `data` channel carries binary payloads associated with read operations. Binary payloads are framed; EOF is never a successful terminator.
+The `comm` channel carries length-prefixed JSON-RPC messages. The `data` channel carries binary payloads associated with read operations.
 
 ## Connection Pairing
 
@@ -42,48 +42,22 @@ The top-level remote read operation starts with a JSON-RPC `read` request from N
 }
 ```
 
-The read result bytes are sent from agent to Nexus on the `data` channel using the batch stream frame format.
+The read result bytes are sent from agent to Nexus on the `data` channel as one Apache Arrow IPC stream.
 
-### Batch Stream Header
-
-Each top-level `read` result stream starts with one protocol version byte.
+Arrow schema:
 
 ```text
-byte protocolVersion = 1
-```
-
-### Data Frame
-
-```text
-byte  frameType = 0x01
-byte  resourceIndex
-int32 payloadLength, little-endian
-byte[payloadLength] payload
+resourceIndex: int32
+offset: int64
+data: binary
+status: binary
 ```
 
 `resourceIndex` identifies the requested resource in the `remoteReadRequests` array. A batch can contain at most 256 resources.
 
-The payload is the concatenation of the resource's `Data` buffer followed by its `Status` buffer. The receiver fills `Data` first and then `Status` across one or more frames for the same resource.
+`offset` is the element offset within that resource's requested range. `data` contains raw encoded data bytes for the chunk. `status` contains one status byte per element for the same chunk. The receiver uses the resource representation to validate that `data` and `status` describe the same element count.
 
-`payloadLength` must be greater than zero and at most 4 MiB.
-
-### Error Frame
-
-```text
-byte  frameType = 0x02
-int32 messageLength, little-endian
-byte[messageLength] utf8Message
-```
-
-`messageLength` must be at most 64 KiB.
-
-### End Frame
-
-```text
-byte frameType = 0x03
-```
-
-The End frame is required. Reaching EOF before End is a protocol failure.
+Initial and source-level failures are reported by the JSON-RPC `read` response on the `comm` channel. There are no custom Nexus error frames inside the top-level Arrow stream.
 
 ## readData Callback Request
 
@@ -101,13 +75,7 @@ During a top-level remote read, the agent can ask Nexus to provide additional so
 
 ## readData Callback Response
 
-Nexus sends `readData` callback response bytes back to the agent on the `data` channel. This direction uses the same versioned frame envelope and request-id correlation so multiple concurrent `readData` callbacks can share the connection safely.
-
-Each top-level `read` operation resets this reverse response stream. The first `readData` response frame sequence starts with one protocol version byte.
-
-```text
-byte protocolVersion = 1
-```
+Nexus sends `readData` callback response bytes back to the agent on the `data` channel. This direction uses request-id framing so multiple concurrent `readData` callbacks can share the connection safely.
 
 ### readData Data Frame
 
@@ -120,7 +88,16 @@ byte[payloadLength] payload
 
 `requestId` matches the id from the `readData` JSON-RPC notification.
 
-The payload contains the requested `double[]` data as bytes. `payloadLength` must be greater than zero and at most 4 MiB. Large responses are split into multiple Data frames with the same `requestId`.
+The payload bytes for a completed successful response form one Apache Arrow IPC stream. Large Arrow streams are split into multiple Data frames with the same `requestId`. `payloadLength` must be greater than zero and at most 4 MiB.
+
+Arrow schema:
+
+```text
+offset: int64
+values: list<float64>
+```
+
+`offset` is the element offset within the requested range. `values` contains the requested `double[]` values for that chunk. `readData` has no status payload.
 
 ### readData Error Frame
 
@@ -149,11 +126,11 @@ Nexus -> Agent comm:
   JSON-RPC source calls, including top-level read
 
 Agent -> Nexus data:
-  top-level read result batch frames
+  top-level read result Arrow IPC stream
 
 Agent -> Nexus comm:
   JSON-RPC notifications, including readData callback requests
 
 Nexus -> Agent data:
-  request-id framed readData callback responses
+  request-id framed readData callback responses with Arrow IPC success payloads
 ```

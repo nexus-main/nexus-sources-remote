@@ -1,6 +1,10 @@
 ﻿using System.Buffers.Binary;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 using Microsoft.Extensions.Logging;
 using StreamJsonRpc;
 
@@ -26,17 +30,11 @@ internal class RemoteCommunicator : IDisposable
 
     private readonly Func<int, string, DateTime, DateTime, Task> _readData;
 
-    private readonly byte[] _byteBuffer = new byte[1];
-
-    private readonly byte[] _int32Buffer = new byte[4];
-
     private readonly byte[] _readDataResponseDataFrameHeader = new byte[9];
 
     private readonly byte[] _readDataResponseEndFrameHeader = new byte[5];
 
     private readonly byte[] _readDataResponseErrorFrameHeader = new byte[9];
-
-    private bool _readDataResponseProtocolVersionWritten;
 
     private readonly SemaphoreSlim _dataWriteLock = new(1, 1);
 
@@ -100,32 +98,6 @@ internal class RemoteCommunicator : IDisposable
         return _rpcServer;
     }
 
-    public ValueTask ReadRawAsync(Memory<byte> buffer, CancellationToken cancellationToken)
-    {
-        if (_dataStream is null)
-            throw new Exception("You need to connect before read any data");
-
-        return _dataStream.ReadExactlyAsync(buffer, cancellationToken);
-    }
-
-    public async Task<byte> ReadByteAsync(CancellationToken cancellationToken)
-    {
-        if (_dataStream is null)
-            throw new Exception("You need to connect before read any data");
-
-        await _dataStream.ReadExactlyAsync(_byteBuffer, cancellationToken);
-        return _byteBuffer[0];
-    }
-
-    public async Task<int> ReadInt32LittleEndianAsync(CancellationToken cancellationToken)
-    {
-        if (_dataStream is null)
-            throw new Exception("You need to connect before read any data");
-
-        await _dataStream.ReadExactlyAsync(_int32Buffer, cancellationToken);
-        return BinaryPrimitives.ReadInt32LittleEndian(_int32Buffer);
-    }
-
     public Task WriteReadDataResponseAsync(
         int requestId,
         ReadOnlyMemory<byte> data,
@@ -150,7 +122,15 @@ internal class RemoteCommunicator : IDisposable
 
     public void ResetReadDataResponseProtocol()
     {
-        _readDataResponseProtocolVersionWritten = false;
+        // Success payloads are self-contained Arrow IPC streams; request-id framing remains for correlation.
+    }
+
+    public ArrowStreamReader CreateArrowStreamReader()
+    {
+        if (_dataStream is null)
+            throw new Exception("You need to connect before read any data");
+
+        return new ArrowStreamReader(_dataStream);
     }
 
     private async Task InternalWriteReadDataResponseAsync(
@@ -162,9 +142,7 @@ internal class RemoteCommunicator : IDisposable
 
         try
         {
-            await WriteReadDataResponseProtocolVersionAsync(cancellationToken);
-
-            var remainingData = data;
+            var remainingData = CreateReadDataArrowStream(data).AsMemory();
 
             while (!remainingData.IsEmpty)
             {
@@ -199,8 +177,6 @@ internal class RemoteCommunicator : IDisposable
 
         try
         {
-            await WriteReadDataResponseProtocolVersionAsync(cancellationToken);
-
             var msgBytes = Encoding.UTF8.GetBytes(message);
 
             if (msgBytes.Length > Remote.MAX_ERROR_MESSAGE_LENGTH)
@@ -224,13 +200,43 @@ internal class RemoteCommunicator : IDisposable
         }
     }
 
-    private async Task WriteReadDataResponseProtocolVersionAsync(CancellationToken cancellationToken)
+    private static byte[] CreateReadDataArrowStream(ReadOnlyMemory<byte> data)
     {
-        if (_readDataResponseProtocolVersionWritten)
-            return;
+        if (data.Length % sizeof(double) != 0)
+            throw new Exception("The readData response buffer length is not a multiple of the double element size.");
 
-        await _dataStream!.WriteAsync(new[] { Remote.BATCH_STREAM_PROTOCOL_VERSION }, cancellationToken);
-        _readDataResponseProtocolVersionWritten = true;
+        var valueCount = data.Length / sizeof(double);
+        var schema = CreateReadDataSchema();
+        using var stream = new MemoryStream();
+        using var writer = new ArrowStreamWriter(stream, schema);
+        using var recordBatch = CreateReadDataRecordBatch(schema, data, valueCount);
+
+        writer.WriteRecordBatch(recordBatch);
+        writer.WriteEnd();
+
+        return stream.ToArray();
+    }
+
+    private static Schema CreateReadDataSchema()
+    {
+        var fields = new[]
+        {
+            new Field("offset", new Int64Type(), nullable: false, metadata: []),
+            new Field("values", new ListType(new DoubleType()), nullable: false, metadata: [])
+        };
+
+        return new Schema(fields, metadata: []);
+    }
+
+    private static RecordBatch CreateReadDataRecordBatch(Schema schema, ReadOnlyMemory<byte> data, int valueCount)
+    {
+        var offsetArray = new Int64Array.Builder().Append(0).Build(default);
+        var offsetsBytes = MemoryMarshal.AsBytes(new[] { 0, valueCount }.AsSpan()).ToArray();
+        var offsetsBuffer = new ArrowBuffer(offsetsBytes);
+        var valueArray = new DoubleArray(new ArrowBuffer(data), ArrowBuffer.Empty, valueCount, nullCount: 0, offset: 0);
+        var listArray = new ListArray(new ListType(new DoubleType()), 1, offsetsBuffer, valueArray, ArrowBuffer.Empty, 0, 0);
+
+        return new RecordBatch(schema, [offsetArray, listArray], 1);
     }
 
 #region IDisposable

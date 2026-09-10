@@ -26,6 +26,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Apache.Arrow" />
     <ProjectReference Include="../../../../nexus/src/extensibility/dotnet-extensibility/dotnet-extensibility.csproj" />
   </ItemGroup>
 

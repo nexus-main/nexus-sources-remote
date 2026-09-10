@@ -76,7 +76,7 @@ public class RemoteTests(RemoteTestsFixture fixture)
         var expectedProperties1 = new Dictionary<string, object>() { ["a"] = "b", ["c"] = 1 };
         var expectedIds = new List<string>() { "resource1", "resource2" };
         var expectedUnits = new List<string>() { "°C", "bar" };
-        var expectedDataTypes = new List<NexusDataType>() { NexusDataType.INT64, NexusDataType.FLOAT64 };
+        var expectedDataTypes = new List<NexusDataType>() { NexusDataType.Int64, NexusDataType.Float64 };
         var expectedGroups = new List<string>() { "group1", "group2" };
 
         Assert.True(JsonSerializer.Serialize(actualProperties1) == JsonSerializer.Serialize(expectedProperties1));

@@ -83,7 +83,7 @@ public class Test : TestBase, IDataSource<TestSettings>
     {
         if (catalog.Id == "/A/B/C")
         {
-            var representation1 = new Representation(NexusDataType.INT64, TimeSpan.FromSeconds(1));
+            var representation1 = new Representation(NexusDataType.Int64, TimeSpan.FromSeconds(1));
 
             var resource1 = new ResourceBuilder("resource1")
                 .WithUnit("°C")
@@ -91,7 +91,7 @@ public class Test : TestBase, IDataSource<TestSettings>
                 .AddRepresentation(representation1)
                 .Build();
 
-            var representation2 = new Representation(NexusDataType.FLOAT64, TimeSpan.FromSeconds(1));
+            var representation2 = new Representation(NexusDataType.Float64, TimeSpan.FromSeconds(1));
 
             var resource2 = new ResourceBuilder("resource2")
                 .WithUnit("bar")
@@ -107,7 +107,7 @@ public class Test : TestBase, IDataSource<TestSettings>
         }
         else if (catalog.Id == "/D/E/F")
         {
-            var representation = new Representation(NexusDataType.FLOAT64, TimeSpan.FromSeconds(1));
+            var representation = new Representation(NexusDataType.Float64, TimeSpan.FromSeconds(1));
 
             var resource = new ResourceBuilder("resource1")
                 .WithUnit("m/s")

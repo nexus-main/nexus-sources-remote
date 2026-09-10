@@ -1,10 +1,12 @@
 ﻿using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 using Nexus.DataModel;
 using Nexus.Extensibility;
 using System.Buffers;
 using System.Reflection;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -23,7 +25,6 @@ public record RemoteSettings(
 public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource, IDisposable
 {
     private const int DEFAULT_AGENT_PORT = 56145;
-    internal const byte BATCH_STREAM_PROTOCOL_VERSION = 1;
     internal const int MAX_BATCH_STREAM_PAYLOAD_LENGTH = 4 * 1024 * 1024;
     internal const int MAX_ERROR_MESSAGE_LENGTH = 64 * 1024;
 
@@ -202,16 +203,11 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
             try
             {
-                _communicator.ResetReadDataResponseProtocol();
                 var rpcTask = _rpcServer.ReadAsync(begin, end, remoteRequests, cancellationToken);
-                var protocolVersion = await ReadByteAsync(rpcTask, cancellationToken);
-
-                if (protocolVersion != BATCH_STREAM_PROTOCOL_VERSION)
-                    throw new RemoteException($"Unsupported remote batch stream protocol version '{protocolVersion}'.");
-
                 var counter = 0.0;
                 var completedRequests = new bool[requests.Length];
-                var receivedPayloadLengths = new int[requests.Length];
+                var receivedDataLengths = new int[requests.Length];
+                var receivedStatusLengths = new int[requests.Length];
 
                 for (int i = 0; i < requests.Length; i++)
                 {
@@ -223,38 +219,13 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                     }
                 }
 
+                using var reader = _communicator.CreateArrowStreamReader();
+
                 while (true)
                 {
-                    var frameType = await ReadByteAsync(rpcTask, cancellationToken);
+                    using var recordBatch = await ReadNextRecordBatchAsync(reader, rpcTask, cancellationToken);
 
-                    if (frameType == 0x01) // Data
-                    {
-                        var index = await _communicator.ReadByteAsync(cancellationToken);
-                        ValidateFrameIndex(index, requests.Length);
-
-                        var payloadLength = await _communicator.ReadInt32LittleEndianAsync(cancellationToken);
-                        ValidatePayloadLength(payloadLength, requests[index], receivedPayloadLengths[index]);
-
-                        await ReadPayloadAsync(requests[index], receivedPayloadLengths[index], payloadLength, cancellationToken);
-                        receivedPayloadLengths[index] += payloadLength;
-
-                        if (!completedRequests[index] && receivedPayloadLengths[index] == GetExpectedPayloadLength(requests[index]))
-                        {
-                            completedRequests[index] = true;
-                            await requests[index].CompleteAsync();
-                            progress.Report(++counter / requests.Length);
-                        }
-                    }
-
-                    else if (frameType == 0x02) // Error
-                    {
-                        var msgLen = await ReadErrorMessageLengthAsync(cancellationToken);
-                        var msgBytes = new byte[msgLen];
-                        await _communicator.ReadRawAsync(msgBytes, cancellationToken);
-                        throw new RemoteException(Encoding.UTF8.GetString(msgBytes));
-                    }
-
-                    else if (frameType == 0x03) // End
+                    if (recordBatch is null)
                     {
                         await rpcTask;
 
@@ -264,9 +235,30 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
                         break;
                     }
 
-                    else
+                    var (resourceIndexArray, offsetArray, dataArray, statusArray) = GetArrowArrays(recordBatch);
+
+                    for (var rowIndex = 0; rowIndex < recordBatch.Length; rowIndex++)
                     {
-                        throw new Exception($"Unknown frame type '{frameType}'.");
+                        var index = resourceIndexArray.GetValue(rowIndex) ?? throw new RemoteException("The remote read operation returned a null resource index.");
+                        ValidateFrameIndex(index, requests.Length);
+
+                        var offset = offsetArray.GetValue(rowIndex) ?? throw new RemoteException("The remote read operation returned a null offset.");
+                        CopyArrowPayload(
+                            requests[index],
+                            offset,
+                            dataArray.GetBytes(rowIndex),
+                            statusArray.GetBytes(rowIndex),
+                            ref receivedDataLengths[index],
+                            ref receivedStatusLengths[index]);
+
+                        if (!completedRequests[index] &&
+                            receivedDataLengths[index] == requests[index].Data.Length &&
+                            receivedStatusLengths[index] == requests[index].Status.Length)
+                        {
+                            completedRequests[index] = true;
+                            await requests[index].CompleteAsync();
+                            progress.Report(++counter / requests.Length);
+                        }
                     }
                 }
             }
@@ -287,19 +279,91 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
             throw new RemoteException("The remote read operation returned an invalid resource index.");
     }
 
-    private async Task<int> ReadErrorMessageLengthAsync(CancellationToken cancellationToken)
+    private static (Int32Array ResourceIndexArray, Int64Array OffsetArray, BinaryArray DataArray, BinaryArray StatusArray) GetArrowArrays(RecordBatch recordBatch)
     {
-        var messageLength = await _communicator.ReadInt32LittleEndianAsync(cancellationToken);
+        var fields = recordBatch.Schema.FieldsList;
 
-        if (messageLength < 0 || messageLength > MAX_ERROR_MESSAGE_LENGTH)
-            throw new RemoteException("The remote read operation returned an invalid error message length.");
+        if (fields.Count != 4 ||
+            fields[0].Name != "resourceIndex" || fields[0].DataType is not Int32Type ||
+            fields[1].Name != "offset" || fields[1].DataType is not Int64Type ||
+            fields[2].Name != "data" || fields[2].DataType is not BinaryType ||
+            fields[3].Name != "status" || fields[3].DataType is not BinaryType)
+            throw new RemoteException("The remote read operation returned an invalid Arrow schema.");
 
-        return messageLength;
+        Int32Array? resourceIndexArray = null;
+        Int64Array? offsetArray = null;
+        BinaryArray? dataArray = null;
+        BinaryArray? statusArray = null;
+        var columnIndex = 0;
+
+        foreach (var array in recordBatch.Arrays)
+        {
+            switch (columnIndex)
+            {
+                case 0 when array is Int32Array current:
+                    resourceIndexArray = current;
+                    break;
+                case 1 when array is Int64Array current:
+                    offsetArray = current;
+                    break;
+                case 2 when array is BinaryArray current:
+                    dataArray = current;
+                    break;
+                case 3 when array is BinaryArray current:
+                    statusArray = current;
+                    break;
+                default:
+                    throw new RemoteException("The remote read operation returned an invalid Arrow schema.");
+            }
+
+            columnIndex++;
+        }
+
+        if (columnIndex != 4 || resourceIndexArray is null || offsetArray is null || dataArray is null || statusArray is null)
+            throw new RemoteException("The remote read operation returned an invalid Arrow schema.");
+
+        return (resourceIndexArray, offsetArray, dataArray, statusArray);
     }
 
-    private async Task<byte> ReadByteAsync(Task rpcTask, CancellationToken cancellationToken)
+    private static void CopyArrowPayload(
+        ReadRequest request,
+        long offset,
+        ReadOnlySpan<byte> data,
+        ReadOnlySpan<byte> status,
+        ref int receivedDataLength,
+        ref int receivedStatusLength)
     {
-        var readTask = _communicator.ReadByteAsync(cancellationToken);
+        var elementSize = request.CatalogItem.Representation.ElementSize;
+
+        if (offset < 0 || offset > int.MaxValue)
+            throw new RemoteException("The remote read operation returned an invalid offset.");
+
+        if (data.Length % elementSize != 0)
+            throw new RemoteException("The remote read operation returned a data payload with an unexpected length.");
+
+        var elementCount = data.Length / elementSize;
+
+        if (status.Length != elementCount)
+            throw new RemoteException("The remote read operation returned data and status payloads with different element counts.");
+
+        var targetElementOffset = checked((int)offset);
+        var targetDataOffset = checked(targetElementOffset * elementSize);
+
+        if (targetDataOffset < receivedDataLength || targetElementOffset < receivedStatusLength)
+            throw new RemoteException("The remote read operation returned payloads out of order.");
+
+        if (targetDataOffset + data.Length > request.Data.Length || targetElementOffset + status.Length > request.Status.Length)
+            throw new RemoteException("The remote read operation returned payloads outside the requested range.");
+
+        data.CopyTo(request.Data.Span.Slice(targetDataOffset, data.Length));
+        status.CopyTo(request.Status.Span.Slice(targetElementOffset, status.Length));
+        receivedDataLength = targetDataOffset + data.Length;
+        receivedStatusLength = targetElementOffset + status.Length;
+    }
+
+    private static async Task<RecordBatch?> ReadNextRecordBatchAsync(ArrowStreamReader reader, Task rpcTask, CancellationToken cancellationToken)
+    {
+        var readTask = reader.ReadNextRecordBatchAsync(cancellationToken).AsTask();
 #pragma warning disable VSTHRD003 // Intentionally race the RPC task to surface remote failures before waiting for data.
         var completedTask = await Task.WhenAny(readTask, rpcTask).ConfigureAwait(false);
 
@@ -308,42 +372,6 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
         return await readTask.ConfigureAwait(false);
 #pragma warning restore VSTHRD003
-    }
-
-    private async Task ReadPayloadAsync(
-        ReadRequest request,
-        int payloadOffset,
-        int payloadLength,
-        CancellationToken cancellationToken)
-    {
-        var dataLength = request.Data.Length;
-        var remainingPayloadLength = payloadLength;
-        var currentPayloadOffset = payloadOffset;
-
-        if (currentPayloadOffset < dataLength)
-        {
-            var dataByteCount = Math.Min(dataLength - currentPayloadOffset, remainingPayloadLength);
-            await _communicator.ReadRawAsync(request.Data.Slice(currentPayloadOffset, dataByteCount), cancellationToken);
-            currentPayloadOffset += dataByteCount;
-            remainingPayloadLength -= dataByteCount;
-        }
-
-        if (remainingPayloadLength > 0)
-        {
-            var statusOffset = currentPayloadOffset - dataLength;
-            await _communicator.ReadRawAsync(request.Status.Slice(statusOffset, remainingPayloadLength), cancellationToken);
-        }
-    }
-
-    private static void ValidatePayloadLength(int payloadLength, ReadRequest request, int receivedPayloadLength)
-    {
-        var expectedLength = GetExpectedPayloadLength(request);
-
-        if (payloadLength <= 0 || payloadLength > MAX_BATCH_STREAM_PAYLOAD_LENGTH)
-            throw new RemoteException("The remote read operation returned an invalid payload length.");
-
-        if (payloadLength > expectedLength - receivedPayloadLength)
-            throw new RemoteException("The remote read operation returned a payload with an unexpected length.");
     }
 
     private static int GetExpectedPayloadLength(ReadRequest request)

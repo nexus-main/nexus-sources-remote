@@ -1,4 +1,7 @@
 using Microsoft.Extensions.Logging;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 using Nexus.DataModel;
 using Nexus.Extensibility;
 using System.Buffers;
@@ -7,7 +10,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -62,7 +64,6 @@ internal class Logger(
 /// </summary>
 public class RemoteCommunicator
 {
-    private const byte BatchStreamProtocolVersion = 1;
     private const int MaximumBatchStreamPayloadLength = 4 * 1024 * 1024;
     private const int MaximumBatchStreamErrorMessageLength = 64 * 1024;
 
@@ -81,16 +82,6 @@ public class RemoteCommunicator
     private IDataSource? _dataSource = default;
 
     private readonly SemaphoreSlim _frameWriteLock = new(1, 1);
-
-    private readonly byte[] _dataFrameHeader = new byte[6];
-
-    private readonly byte[] _endFrameHeader = new byte[1];
-
-    private readonly byte[] _errorFrameHeader = new byte[5];
-
-    private bool _batchStreamProtocolVersionWritten;
-
-    private bool _readDataResponseProtocolVersionRead;
 
     private readonly SemaphoreSlim _readDataResponseReadLock = new(1, 1);
 
@@ -372,9 +363,9 @@ public class RemoteCommunicator
 
             var readRequests = new ReadRequest[remoteReadRequests.Length];
             var streamedIndices = new HashSet<int>();
-            _batchStreamProtocolVersionWritten = false;
-            _readDataResponseProtocolVersionRead = false;
             _readDataResponses.Clear();
+            var schema = CreateReadSchema();
+            using var arrowWriter = new ArrowStreamWriter(_dataStream, schema);
 
             for (int i = 0; i < remoteReadRequests.Length; i++)
             {
@@ -383,7 +374,7 @@ public class RemoteCommunicator
 
                 Func<CancellationToken, Task> onCompleted = async ct =>
                 {
-                    await WriteDataFrameAsync(index, data, status, ct);
+                    await WriteReadRecordBatchAsync(arrowWriter, schema, index, data, status, remoteReadRequests[index].CatalogItem.Representation.ElementSize, ct);
                     streamedIndices.Add(index);
                 };
 
@@ -396,32 +387,25 @@ public class RemoteCommunicator
                     cancellationToken);
             }
 
-            try
-            {
-                await _dataSource.ReadAsync(
-                    begin,
-                    end,
-                    readRequests,
-                    HandleReadDataAsync,
-                    new Progress<double>(),
-                    cancellationToken);
+            await _dataSource.ReadAsync(
+                begin,
+                end,
+                readRequests,
+                HandleReadDataAsync,
+                new Progress<double>(),
+                cancellationToken);
 
-                for (int i = 0; i < readRequests.Length; i++)
+            for (int i = 0; i < readRequests.Length; i++)
+            {
+                if (!streamedIndices.Contains(i))
                 {
-                    if (!streamedIndices.Contains(i))
-                    {
-                        await WriteDataFrameAsync(i, readRequests[i].Data, readRequests[i].Status, cancellationToken);
-                        streamedIndices.Add(i);
-                    }
+                    await WriteReadRecordBatchAsync(arrowWriter, schema, i, readRequests[i].Data, readRequests[i].Status, remoteReadRequests[i].CatalogItem.Representation.ElementSize, cancellationToken);
+                    streamedIndices.Add(i);
                 }
-
-                await WriteEndFrameAsync(cancellationToken);
             }
 
-            catch (Exception ex)
-            {
-                await WriteErrorFrameAsync(ex, cancellationToken);
-            }
+            await arrowWriter.WriteEndAsync(cancellationToken);
+            await _dataStream.FlushAsync(cancellationToken);
         }
 
         // Add cancellation support?
@@ -506,19 +490,34 @@ public class RemoteCommunicator
         return dataSource.SetContextAsync(context, logger, cancellationToken);
     }
 
-    private async Task WriteDataFrameAsync(
+    private static Schema CreateReadSchema()
+    {
+        var fields = new[]
+        {
+            new Field("resourceIndex", new Int32Type(), nullable: false, metadata: []),
+            new Field("offset", new Int64Type(), nullable: false, metadata: []),
+            new Field("data", new BinaryType(), nullable: false, metadata: []),
+            new Field("status", new BinaryType(), nullable: false, metadata: [])
+        };
+
+        return new Schema(fields, metadata: []);
+    }
+
+    private async Task WriteReadRecordBatchAsync(
+        ArrowStreamWriter writer,
+        Schema schema,
         int index,
         Memory<byte> data,
         Memory<byte> status,
+        int elementSize,
         CancellationToken cancellationToken)
     {
         await _frameWriteLock.WaitAsync(cancellationToken);
 
         try
         {
-            await WriteBatchStreamProtocolVersionAsync(cancellationToken);
-
-            await WritePayloadFramesAsync(index, data, status, cancellationToken);
+            using var recordBatch = CreateReadRecordBatch(schema, index, 0, data, status, elementSize);
+            await writer.WriteRecordBatchAsync(recordBatch, cancellationToken);
             await _dataStream.FlushAsync(cancellationToken);
         }
         finally
@@ -527,109 +526,28 @@ public class RemoteCommunicator
         }
     }
 
-    private async Task WritePayloadFramesAsync(
+    private static RecordBatch CreateReadRecordBatch(
+        Schema schema,
         int index,
+        long offset,
         ReadOnlyMemory<byte> data,
         ReadOnlyMemory<byte> status,
-        CancellationToken cancellationToken)
+        int elementSize)
     {
-        var remainingData = data;
-        var remainingStatus = status;
+        if (data.Length % elementSize != 0)
+            throw new Exception("The remote read data buffer length is not a multiple of the representation element size.");
 
-        while (!remainingData.IsEmpty || !remainingStatus.IsEmpty)
-        {
-            var payloadLength = Math.Min(
-                remainingData.Length + remainingStatus.Length,
-                MaximumBatchStreamPayloadLength);
-            var remainingPayloadLength = payloadLength;
+        var elementCount = data.Length / elementSize;
 
-            _dataFrameHeader[0] = 0x01;
-            _dataFrameHeader[1] = (byte)index;
-            BinaryPrimitives.WriteInt32LittleEndian(_dataFrameHeader.AsSpan(2), payloadLength);
-            await _dataStream.WriteAsync(_dataFrameHeader, cancellationToken);
+        if (status.Length != elementCount)
+            throw new Exception("The remote read data and status buffers have different element counts.");
 
-            if (!remainingData.IsEmpty)
-            {
-                var dataByteCount = Math.Min(remainingData.Length, remainingPayloadLength);
-                await _dataStream.WriteAsync(remainingData[..dataByteCount], cancellationToken);
-                remainingData = remainingData[dataByteCount..];
-                remainingPayloadLength -= dataByteCount;
-            }
+        var resourceIndexArray = new Int32Array.Builder().Append(index).Build(default);
+        var offsetArray = new Int64Array.Builder().Append(offset).Build(default);
+        var dataArray = new BinaryArray.Builder().Append(data.Span).Build(default);
+        var statusArray = new BinaryArray.Builder().Append(status.Span).Build(default);
 
-            if (remainingPayloadLength > 0)
-            {
-                await _dataStream.WriteAsync(remainingStatus[..remainingPayloadLength], cancellationToken);
-                remainingStatus = remainingStatus[remainingPayloadLength..];
-            }
-        }
-    }
-
-    private async Task WriteEndFrameAsync(CancellationToken cancellationToken)
-    {
-        await _frameWriteLock.WaitAsync(cancellationToken);
-
-        try
-        {
-            await WriteBatchStreamProtocolVersionAsync(cancellationToken);
-
-            _endFrameHeader[0] = 0x03;
-            await _dataStream.WriteAsync(_endFrameHeader, cancellationToken);
-
-            await _dataStream.FlushAsync(cancellationToken);
-        }
-        finally
-        {
-            _frameWriteLock.Release();
-        }
-    }
-
-    private async Task WriteErrorFrameAsync(
-        Exception exception,
-        CancellationToken cancellationToken)
-    {
-        await _frameWriteLock.WaitAsync(cancellationToken);
-
-        try
-        {
-            await WriteBatchStreamProtocolVersionAsync(cancellationToken);
-
-            var msgBytes = Encoding.UTF8.GetBytes(GetBatchStreamErrorMessage(exception));
-            _errorFrameHeader[0] = 0x02;
-            BinaryPrimitives.WriteInt32LittleEndian(_errorFrameHeader.AsSpan(1), msgBytes.Length);
-            await _dataStream.WriteAsync(_errorFrameHeader, cancellationToken);
-            await _dataStream.WriteAsync(msgBytes, cancellationToken);
-
-            await _dataStream.FlushAsync(cancellationToken);
-        }
-        finally
-        {
-            _frameWriteLock.Release();
-        }
-    }
-
-    private async Task WriteBatchStreamProtocolVersionAsync(CancellationToken cancellationToken)
-    {
-        if (_batchStreamProtocolVersionWritten)
-            return;
-
-        await _dataStream.WriteAsync(new[] { BatchStreamProtocolVersion }, cancellationToken);
-        _batchStreamProtocolVersionWritten = true;
-    }
-
-    private static string GetBatchStreamErrorMessage(Exception exception)
-    {
-        var message = exception.Message;
-
-        if (string.IsNullOrWhiteSpace(message))
-            message = "The remote batch stream failed.";
-
-        if (Encoding.UTF8.GetByteCount(message) <= MaximumBatchStreamErrorMessageLength)
-            return message;
-
-        while (Encoding.UTF8.GetByteCount(message) > MaximumBatchStreamErrorMessageLength)
-            message = message[..(message.Length - 1)];
-
-        return message;
+        return new RecordBatch(schema, [resourceIndexArray, offsetArray, dataArray, statusArray], 1);
     }
 
     private async Task HandleReadDataAsync(
@@ -659,14 +577,13 @@ public class RemoteCommunicator
         await Utilities.SendToServerAsync(readDataRequest, _commStream, cancellationToken);
         _watchdogTimer.Restart();
 
-        using var byteBuffer = new CastMemoryManager<double, byte>(buffer);
-        await ReadReadDataResponseAsync(requestId, byteBuffer.Memory, cancellationToken);
+        await ReadReadDataResponseAsync(requestId, buffer, cancellationToken);
         _watchdogTimer.Restart();
     }
 
     private async Task ReadReadDataResponseAsync(
         int requestId,
-        Memory<byte> target,
+        Memory<double> target,
         CancellationToken cancellationToken)
     {
         await _readDataResponseReadLock.WaitAsync(cancellationToken);
@@ -682,23 +599,8 @@ public class RemoteCommunicator
                     if (completedResponse.ErrorMessage is not null)
                         throw new Exception(completedResponse.ErrorMessage);
 
-                    var data = completedResponse.ToArray();
-
-                    if (data.Length != target.Length)
-                        throw new Exception("Data returned by Nexus have an unexpected length");
-
-                    data.CopyTo(target);
+                    CopyReadDataArrowStream(completedResponse.ToArray(), target);
                     return;
-                }
-
-                if (!_readDataResponseProtocolVersionRead)
-                {
-                    var protocolVersion = await ReadByteAsync(cancellationToken);
-
-                    if (protocolVersion != BatchStreamProtocolVersion)
-                        throw new Exception($"Unsupported readData response protocol version '{protocolVersion}'.");
-
-                    _readDataResponseProtocolVersionRead = true;
                 }
 
                 var frameType = await ReadByteAsync(cancellationToken);
@@ -757,6 +659,88 @@ public class RemoteCommunicator
         return builder;
     }
 
+    private static void CopyReadDataArrowStream(byte[] data, Memory<double> target)
+    {
+        using var stream = new MemoryStream(data);
+        using var reader = new ArrowStreamReader(stream);
+        var copiedValues = 0;
+
+        while (true)
+        {
+            using var recordBatch = reader.ReadNextRecordBatch();
+
+            if (recordBatch is null)
+                break;
+
+            var (offsetArray, valuesArray) = GetReadDataArrowArrays(recordBatch);
+
+            for (var rowIndex = 0; rowIndex < recordBatch.Length; rowIndex++)
+            {
+                var offset = offsetArray.GetValue(rowIndex) ?? throw new Exception("The readData response returned a null offset.");
+                var length = valuesArray.GetValueLength(rowIndex);
+
+                if (offset < 0 || offset > int.MaxValue)
+                    throw new Exception("The readData response returned an invalid offset.");
+
+                var targetOffset = checked((int)offset);
+
+                if (targetOffset < copiedValues || targetOffset + length > target.Length)
+                    throw new Exception("The readData response returned values outside the requested range.");
+
+                CopyReadDataArrowValues(valuesArray, rowIndex, length, target.Slice(targetOffset, length));
+                copiedValues = targetOffset + length;
+            }
+        }
+
+        if (copiedValues != target.Length)
+            throw new Exception("Data returned by Nexus have an unexpected length");
+    }
+
+    private static (Int64Array OffsetArray, ListArray ValuesArray) GetReadDataArrowArrays(RecordBatch recordBatch)
+    {
+        var fields = recordBatch.Schema.FieldsList;
+
+        if (fields.Count != 2 ||
+            fields[0].Name != "offset" || fields[0].DataType is not Int64Type ||
+            fields[1].Name != "values" || fields[1].DataType is not ListType { ValueDataType: DoubleType })
+            throw new Exception("The readData response returned an invalid Arrow schema.");
+
+        Int64Array? offsetArray = null;
+        ListArray? valuesArray = null;
+        var columnIndex = 0;
+
+        foreach (var array in recordBatch.Arrays)
+        {
+            switch (columnIndex)
+            {
+                case 0 when array is Int64Array current:
+                    offsetArray = current;
+                    break;
+                case 1 when array is ListArray current:
+                    valuesArray = current;
+                    break;
+                default:
+                    throw new Exception("The readData response returned an invalid Arrow schema.");
+            }
+
+            columnIndex++;
+        }
+
+        if (columnIndex != 2 || offsetArray is null || valuesArray is null)
+            throw new Exception("The readData response returned an invalid Arrow schema.");
+
+        return (offsetArray, valuesArray);
+    }
+
+    private static void CopyReadDataArrowValues(ListArray valuesArray, int rowIndex, int length, Memory<double> target)
+    {
+        if (valuesArray.Values is not DoubleArray doubleArray)
+            throw new Exception("The readData response returned an invalid Arrow values array.");
+
+        var valueOffset = valuesArray.ValueOffsets[rowIndex];
+        doubleArray.Values.Slice(valueOffset, length).CopyTo(target.Span);
+    }
+
     private async Task<byte> ReadByteAsync(CancellationToken cancellationToken)
     {
         var buffer = new byte[1];
@@ -803,7 +787,7 @@ internal static class Utilities
     {
         var encodedResponse = JsonSerializer.SerializeToUtf8Bytes(response, JsonSerializerOptions);
         var messageLength = BitConverter.GetBytes(encodedResponse.Length);
-        Array.Reverse(messageLength);
+        System.Array.Reverse(messageLength);
 
         await _semaphore.WaitAsync(TimeSpan.FromMinutes(1), cancellationToken);
 
@@ -834,24 +818,6 @@ internal static class StreamExtensions
             buffer = buffer[read..];
         }
     }
-}
-
-internal class CastMemoryManager<TFrom, TTo>(Memory<TFrom> from) : MemoryManager<TTo>
-        where TFrom : struct
-        where TTo : struct
-{
-    private readonly Memory<TFrom> _from = from;
-
-    public override Span<TTo> GetSpan() => MemoryMarshal.Cast<TFrom, TTo>(_from.Span);
-
-    protected override void Dispose(bool disposing)
-    {
-        //
-    }
-
-    public override MemoryHandle Pin(int elementIndex = 0) => throw new NotSupportedException("CastMemoryManager does not support pinning.");
-
-    public override void Unpin() => throw new NotSupportedException("CastMemoryManager does not support unpinning.");
 }
 
 internal class RoundtripDateTimeConverter : JsonConverter<DateTime>

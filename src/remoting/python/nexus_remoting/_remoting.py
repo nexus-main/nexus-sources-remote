@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import struct
 import time
@@ -9,11 +10,13 @@ from urllib.parse import urlparse
 
 from nexus_extensibility import (CatalogItem, DataSourceContext,
                                  ExtensibilityUtilities, IDataSource, ILogger,
-                                 IUpgradableDataSource, LogLevel, ReadRequest,
-                                 ResourceCatalog)
+                                 IUpgradableDataSource, LogLevel, NexusDataType,
+                                 ReadRequest, ResourceCatalog)
 
 from ._encoder import (JsonEncoder, JsonEncoderOptions, to_camel_case,
                        to_snake_case)
+import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 
 _json_encoder_options: JsonEncoderOptions = JsonEncoderOptions(
     property_name_encoder=to_camel_case,
@@ -23,9 +26,41 @@ _json_encoder_options: JsonEncoderOptions = JsonEncoderOptions(
 #                                                                                               zfill(26) ensures leading zeros when year is < 1000
 _json_encoder_options.encoders[datetime] = lambda value: value.strftime("%Y-%m-%dT%H:%M:%S.%f").zfill(26) + "0+00:00"
 
-_BATCH_STREAM_PROTOCOL_VERSION = 1
+def _decode_nexus_data_type(type_cls: type[NexusDataType], value: Any) -> NexusDataType:
+    if isinstance(value, int):
+        return NexusDataType(value)
+
+    if not isinstance(value, str):
+        raise Exception(f"Unable to decode {value} into value of type NexusDataType.")
+
+    name = value if value in NexusDataType.__members__ else to_snake_case(value).upper()
+    return NexusDataType[name]
+
+_json_encoder_options.decoders[NexusDataType] = _decode_nexus_data_type
+
 _MAX_BATCH_STREAM_PAYLOAD_LENGTH = 4 * 1024 * 1024
 _MAX_BATCH_STREAM_ERROR_MESSAGE_LENGTH = 64 * 1024
+
+class _AsyncioArrowSink:
+
+    def __init__(self, writer: asyncio.StreamWriter):
+        self._writer = writer
+        self._position = 0
+        self.closed = False
+
+    def write(self, data: bytes) -> int:
+        self._writer.write(data)
+        self._position += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self._position
+
+    def writable(self) -> bool:
+        return True
+
+    def close(self):
+        self.closed = True
 
 class _Logger(ILogger):
 
@@ -107,8 +142,6 @@ class RemoteCommunicator:
         self._data_writer = data_writer
         self._get_data_source_type = get_data_source_type
         self._frame_write_lock = asyncio.Lock()
-        self._batch_stream_protocol_version_written = False
-        self._read_data_response_protocol_version_read = False
         self._read_data_response_read_lock = asyncio.Lock()
         self._read_data_request_id = 0
         self._read_data_responses: dict[int, _ReadDataResponseBuilder] = {}
@@ -292,42 +325,41 @@ class RemoteCommunicator:
 
             read_requests: list[ReadRequest] = []
             streamed_indices: set[int] = set()
-            self._batch_stream_protocol_version_written = False
-            self._read_data_response_protocol_version_read = False
             self._read_data_responses.clear()
+            schema = self._create_read_schema()
+            sink = _AsyncioArrowSink(self._data_writer)
+            writer = pa_ipc.new_stream(sink, schema)
 
             for index, remote_read_request in enumerate(remote_read_requests):
                 original_resource_name = remote_read_request["originalResourceName"]
                 catalog_item = JsonEncoder.decode(CatalogItem, remote_read_request["catalogItem"], _json_encoder_options)
                 (data, status) = ExtensibilityUtilities.create_buffers(catalog_item.representation, begin, end)
 
-                def _make_callback(idx: int, d: memoryview, s: memoryview):
+                def _make_callback(idx: int, d: memoryview, s: memoryview, element_size: int):
                     async def on_completed():
-                        await self._write_data_frame(idx, d, s)
+                        await self._write_read_record_batch(writer, schema, idx, d, s, element_size)
                         streamed_indices.add(idx)
                     return on_completed
 
-                on_completed = _make_callback(index, data, status)
+                on_completed = _make_callback(index, data, status, catalog_item.representation.element_size)
                 read_requests.append(ReadRequest(original_resource_name, catalog_item, data, status, on_completed))
 
-            try:
-                await self._data_source.read(
-                    begin,
-                    end,
-                    read_requests,
-                    self._handle_read_data,
-                    self._handle_report_progress)
+            await self._data_source.read(
+                begin,
+                end,
+                read_requests,
+                self._handle_read_data,
+                self._handle_report_progress)
 
-                for i in range(len(read_requests)):
-                    if i not in streamed_indices:
-                        read_request = read_requests[i]
-                        await self._write_data_frame(i, read_request.data, read_request.status)
-                        streamed_indices.add(i)
+            for i in range(len(read_requests)):
+                if i not in streamed_indices:
+                    read_request = read_requests[i]
+                    element_size = read_request.catalog_item.representation.element_size
+                    await self._write_read_record_batch(writer, schema, i, read_request.data, read_request.status, element_size)
+                    streamed_indices.add(i)
 
-                await self._write_end_frame()
-
-            except Exception as ex:
-                await self._write_error_frame(ex)
+            writer.close()
+            await self._data_writer.drain()
 
         # Add cancellation support?
         # https://github.com/microsoft/vs-streamjsonrpc/blob/main/doc/sendrequest.md#cancellation
@@ -348,72 +380,50 @@ class RemoteCommunicator:
 
         return result
 
-    async def _write_data_frame(
+    def _create_read_schema(self) -> pa.Schema:
+        return pa.schema([
+            pa.field("resourceIndex", pa.int32(), nullable=False),
+            pa.field("offset", pa.int64(), nullable=False),
+            pa.field("data", pa.binary(), nullable=False),
+            pa.field("status", pa.binary(), nullable=False)
+        ])
+
+    async def _write_read_record_batch(
         self,
+        writer: pa_ipc.RecordBatchStreamWriter,
+        schema: pa.Schema,
         index: int,
         data: memoryview,
-        status: memoryview
+        status: memoryview,
+        element_size: int
     ):
         async with self._frame_write_lock:
-            self._write_batch_stream_protocol_version()
-            self._write_payload_frames(index, data, status)
+            writer.write_batch(self._create_read_record_batch(schema, index, 0, data, status, element_size))
             await self._data_writer.drain()
 
-    def _write_payload_frames(
+    def _create_read_record_batch(
         self,
+        schema: pa.Schema,
         index: int,
+        offset: int,
         data: memoryview,
-        status: memoryview
-    ):
-        data_offset = 0
-        status_offset = 0
+        status: memoryview,
+        element_size: int
+    ) -> pa.RecordBatch:
+        if len(data) % element_size != 0:
+            raise Exception("The remote read data buffer length is not a multiple of the representation element size.")
 
-        while data_offset < len(data) or status_offset < len(status):
-            payload_length = min(
-                len(data) - data_offset + len(status) - status_offset,
-                _MAX_BATCH_STREAM_PAYLOAD_LENGTH)
-            remaining_payload_length = payload_length
+        element_count = len(data) // element_size
 
-            self._data_writer.write(struct.pack("<BBi", 0x01, index, payload_length))
+        if len(status) != element_count:
+            raise Exception("The remote read data and status buffers have different element counts.")
 
-            if data_offset < len(data):
-                data_byte_count = min(len(data) - data_offset, remaining_payload_length)
-                self._data_writer.write(data[data_offset:data_offset + data_byte_count])
-                data_offset += data_byte_count
-                remaining_payload_length -= data_byte_count
-
-            if remaining_payload_length > 0:
-                self._data_writer.write(status[status_offset:status_offset + remaining_payload_length])
-                status_offset += remaining_payload_length
-
-    async def _write_end_frame(self):
-        async with self._frame_write_lock:
-            self._write_batch_stream_protocol_version()
-            self._data_writer.write(struct.pack("B", 0x03))
-            await self._data_writer.drain()
-
-    async def _write_error_frame(self, exception: Exception):
-        async with self._frame_write_lock:
-            self._write_batch_stream_protocol_version()
-            msg_bytes = self._get_batch_stream_error_message(exception).encode("utf-8")
-            self._data_writer.write(struct.pack("<Bi", 0x02, len(msg_bytes)))
-            self._data_writer.write(msg_bytes)
-            await self._data_writer.drain()
-
-    def _write_batch_stream_protocol_version(self):
-        if self._batch_stream_protocol_version_written:
-            return
-
-        self._data_writer.write(struct.pack("B", _BATCH_STREAM_PROTOCOL_VERSION))
-        self._batch_stream_protocol_version_written = True
-
-    def _get_batch_stream_error_message(self, exception: Exception) -> str:
-        message = str(exception).strip() or "The remote batch stream failed."
-
-        while len(message.encode("utf-8")) > _MAX_BATCH_STREAM_ERROR_MESSAGE_LENGTH:
-            message = message[:-1]
-
-        return message
+        return pa.record_batch([
+            pa.array([index], type=pa.int32()),
+            pa.array([offset], type=pa.int64()),
+            pa.array([bytes(data)], type=pa.binary()),
+            pa.array([bytes(status)], type=pa.binary())
+        ], schema=schema)
 
     async def _handle_read_data(self, resource_path: str, begin: datetime, end: datetime) -> memoryview:
 
@@ -451,16 +461,7 @@ class RemoteCommunicator:
                     if completed_response.error_message is not None:
                         raise Exception(completed_response.error_message)
 
-                    return completed_response.to_bytes()
-
-                if not self._read_data_response_protocol_version_read:
-                    protocol_version_bytes = await asyncio.wait_for(self._data_reader.readexactly(1), timeout=60)
-                    protocol_version = struct.unpack("B", protocol_version_bytes)[0]
-
-                    if protocol_version != _BATCH_STREAM_PROTOCOL_VERSION:
-                        raise Exception(f"Unsupported readData response protocol version '{protocol_version}'.")
-
-                    self._read_data_response_protocol_version_read = True
+                    return self._read_read_data_arrow_response(completed_response.to_bytes())
 
                 frame_type_bytes = await asyncio.wait_for(self._data_reader.readexactly(1), timeout=60)
                 frame_type = struct.unpack("B", frame_type_bytes)[0]
@@ -503,6 +504,36 @@ class RemoteCommunicator:
             self._read_data_responses[request_id] = builder
 
         return builder
+
+    def _read_read_data_arrow_response(self, data: bytes) -> bytes:
+        reader = pa_ipc.open_stream(io.BytesIO(data))
+
+        if len(reader.schema) != 2 or \
+            reader.schema.field(0).name != "offset" or not pa.types.is_int64(reader.schema.field(0).type) or \
+            reader.schema.field(1).name != "values" or not pa.types.is_list(reader.schema.field(1).type) or \
+            not pa.types.is_float64(reader.schema.field(1).type.value_type):
+            raise Exception("The readData response returned an invalid Arrow schema.")
+
+        result = bytearray()
+
+        for batch in reader:
+            offset_array = batch.column(0)
+            values_array = batch.column(1)
+
+            for row_index in range(batch.num_rows):
+                offset = offset_array[row_index].as_py()
+                values = values_array[row_index].as_py()
+
+                if offset is None:
+                    raise Exception("The readData response returned a null offset.")
+
+                if offset < 0 or offset != len(result) // 8:
+                    raise Exception("The readData response returned values outside the requested range.")
+
+                for value in values:
+                    result.extend(struct.pack("<d", value))
+
+        return bytes(result)
 
     def _handle_report_progress(self, progress_value: float):
         pass # not implemented

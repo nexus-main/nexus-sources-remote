@@ -47,6 +47,7 @@ setuptools.setup(
     },
     python_requires=">=3.10",
     install_requires=[
-        "nexus-extensibility>=2.0.0b50"
+        "nexus-extensibility>=2.0.0b50",
+        "pyarrow>=16.0.0"
     ]
 )

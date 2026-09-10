@@ -15,6 +15,7 @@
       <ExcludeAssets>runtime;native</ExcludeAssets>
     </ProjectReference>
 	  
+    <PackageReference Include="Apache.Arrow" />
     <PackageReference Include="StreamJsonRpc" />
   </ItemGroup>
 
