@@ -29,22 +29,25 @@ impl TcpClientPair {
 }
 
 pub struct AgentService {
-    client_timeout: Duration,
+    extension_hive: ExtensionHive,
     tcp_client_pairs: Arc<Mutex<HashMap<Uuid, TcpClientPair>>>,
     json_rpc_listen_address: String,
-    json_rpc_listen_port: u16
+    json_rpc_listen_port: u16,
+    client_timeout: Duration
 }
 
 impl AgentService {
     pub fn new(
+        extension_hive: ExtensionHive,
         json_rpc_listen_address: String,
         json_rpc_listen_port: u16,
     ) -> Self {
         Self {
-            client_timeout: Duration::from_secs(60),
+            extension_hive,
             tcp_client_pairs: Arc::new(Mutex::new(HashMap::new())),
             json_rpc_listen_address,
-            json_rpc_listen_port
+            json_rpc_listen_port,
+            client_timeout: Duration::from_secs(60)
         }
     }
 
@@ -91,7 +94,7 @@ impl AgentService {
             let tcp_client_pairs = self.tcp_client_pairs.clone();
 
             smol::spawn(async move {
-                if let Err(e) = AgentService::handle_client(stream, tcp_client_pairs).await {
+                if let Err(e) = self.handle_client(stream, tcp_client_pairs).await {
                     eprintln!("Error handling client: {}", e);
                 }
             })
@@ -100,6 +103,7 @@ impl AgentService {
     }
 
     async fn handle_client(
+        &self,
         stream: TcpStream,
         tcp_client_pairs: Arc<Mutex<HashMap<Uuid, TcpClientPair>>>,
     ) -> smol::io::Result<()> {
@@ -147,6 +151,7 @@ impl AgentService {
 
             let comm_stream = pair.comm_stream.take().unwrap();
             let data_stream = pair.data_stream.take().unwrap();
+            let get_data_source_type = |type_name: &str| self.extension_hive.get_extension_type(type_name);
 
             pair.remote_communicator = Some(RemoteCommunicator::new(comm_stream, data_stream, get_data_source_type));
             pair.remote_communicator.as_ref().unwrap().run().await?;

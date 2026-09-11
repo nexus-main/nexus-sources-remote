@@ -67,6 +67,7 @@ impl RemoteCommunicator {
     pub fn new(
         comm_stream: TcpStream,
         data_stream: TcpStream,
+        get_data_source_type: fn(&str) -> String
     ) -> Self {
         let logger = MyLogger { 
             comm_stream: comm_stream.clone()
