@@ -11,10 +11,6 @@ public class RemoteTestsFixture : IAsyncLifetime
 
     private Process? _runProcess_python;
 
-    private readonly SemaphoreSlim _semaphoreBuild = new(0, 1);
-
-    private readonly SemaphoreSlim _semaphoreRun = new(0, 1);
-
     public Task InitializeAsync()
     {
         var dotnetTask = RunDotnetAgent();
@@ -45,30 +41,25 @@ public class RemoteTestsFixture : IAsyncLifetime
             EnableRaisingEvents = true
         };
 
-        var success = false;
+        var buildCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         _buildProcess_dotnet.OutputDataReceived += (sender, e) =>
         {
             if (e.Data is not null && e.Data.Contains("Build succeeded"))
-            {
-                success = true;
-                _semaphoreBuild.Release();
-            }
+                buildCompleted.TrySetResult(true);
         };
 
         _buildProcess_dotnet.ErrorDataReceived += (sender, e) =>
         {
-            success = false;
-            _semaphoreBuild.Release();
+            if (e.Data is not null)
+                buildCompleted.TrySetResult(false);
         };
 
         _buildProcess_dotnet.Start();
         _buildProcess_dotnet.BeginOutputReadLine();
         _buildProcess_dotnet.BeginErrorReadLine();
 
-        await _semaphoreBuild.WaitAsync(TimeSpan.FromMinutes(1));
-
-        if (!success)
+        if (!await WaitForStartupAsync(buildCompleted.Task))
             throw new Exception("Unable to build Nexus.Agent.");
 
         // Run Nexus.Agent
@@ -91,35 +82,29 @@ public class RemoteTestsFixture : IAsyncLifetime
             EnableRaisingEvents = true
         };
 
+        var runCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
         _runProcess_dotnet.OutputDataReceived += (sender, e) =>
         {
             // File.AppendAllText("/home/vincent/Downloads/output2.txt", e.Data + Environment.NewLine);
 
             if (e.Data is not null && e.Data.Contains("Now listening on"))
-            {
-                success = true;
-                _semaphoreRun.Release();
-            }
+                runCompleted.TrySetResult(true);
         };
 
         _runProcess_dotnet.ErrorDataReceived += (sender, e) =>
         {
             // File.AppendAllText("/home/vincent/Downloads/error2.txt", e.Data + Environment.NewLine);
 
-            var oldSuccess = success;
-            success = false;
-
-            if (oldSuccess)
-                _semaphoreRun.Release();
+            if (e.Data is not null && e.Data.Contains("error", StringComparison.OrdinalIgnoreCase))
+                runCompleted.TrySetResult(false);
         };
 
         _runProcess_dotnet.Start();
         _runProcess_dotnet.BeginOutputReadLine();
         _runProcess_dotnet.BeginErrorReadLine();
 
-        await _semaphoreRun.WaitAsync(TimeSpan.FromMinutes(1));
-
-        if (!success)
+        if (!await WaitForStartupAsync(runCompleted.Task))
             throw new Exception("Unable to launch Nexus.Agent (dotnet).");
     }
 
@@ -145,17 +130,14 @@ public class RemoteTestsFixture : IAsyncLifetime
             EnableRaisingEvents = true
         };
 
-        var success = false;
+        var runCompleted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         _runProcess_python.OutputDataReceived += (sender, e) =>
         {
             // File.AppendAllText("/home/vincent/Downloads/output.txt", e.Data + Environment.NewLine);
 
             if (e.Data is not null && e.Data.Contains("Application startup complete."))
-            {
-                success = true;
-                _semaphoreRun.Release();
-            }
+                runCompleted.TrySetResult(true);
         };
 
         _runProcess_python.ErrorDataReceived += (sender, e) =>
@@ -163,29 +145,30 @@ public class RemoteTestsFixture : IAsyncLifetime
             // File.AppendAllText("/home/vincent/Downloads/error.txt", e.Data + Environment.NewLine);
 
             if (e.Data is not null && e.Data.Contains("Application startup complete."))
-            {
-                success = true;
-                _semaphoreRun.Release();
-            }
+                runCompleted.TrySetResult(true);
 
-            if (e.Data is not null && e.Data.ToLower().Contains("error"))
-            {
-                var oldSuccess = success;
-                success = false;
-
-                if (oldSuccess)
-                    _semaphoreRun.Release();
-            }
+            if (e.Data is not null && e.Data.Contains("error", StringComparison.OrdinalIgnoreCase))
+                runCompleted.TrySetResult(false);
         };
 
         _runProcess_python.Start();
         _runProcess_python.BeginOutputReadLine();
         _runProcess_python.BeginErrorReadLine();
 
-        await _semaphoreRun.WaitAsync(TimeSpan.FromMinutes(1));
-
-        if (!success)
+        if (!await WaitForStartupAsync(runCompleted.Task))
             throw new Exception("Unable to launch Nexus.Agent (python).");
+    }
+
+    private static async Task<bool> WaitForStartupAsync(Task<bool> task)
+    {
+        try
+        {
+            return await task.WaitAsync(TimeSpan.FromMinutes(1));
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 
     public Task DisposeAsync()
