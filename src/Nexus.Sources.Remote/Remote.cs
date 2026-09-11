@@ -186,20 +186,19 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         {
             var counter = 0.0;
 
-            foreach (var (originalResourceName, catalogItem, data, status) in requests)
+            foreach (var request in requests)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(1));
                 cancellationToken.Register(timeoutTokenSource.Cancel);
 
-                var elementCount = data.Length / catalogItem.Representation.ElementSize;
-
                 await _rpcServer
-                    .ReadSingleAsync(begin, end, originalResourceName, catalogItem, timeoutTokenSource.Token);
+                    .ReadSingleAsync(begin, end, request.OriginalResourceName, request.CatalogItem, timeoutTokenSource.Token);
 
-                await _communicator.ReadRawAsync(data, timeoutTokenSource.Token);
-                await _communicator.ReadRawAsync(status, timeoutTokenSource.Token);
+                await _communicator.ReadRawAsync(request.Data, timeoutTokenSource.Token);
+                await _communicator.ReadRawAsync(request.Status, timeoutTokenSource.Token);
+                await request.CompleteAsync();
 
                 progress.Report(++counter / requests.Length);
             }

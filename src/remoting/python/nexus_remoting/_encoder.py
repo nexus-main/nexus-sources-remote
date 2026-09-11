@@ -19,14 +19,14 @@ class JsonEncoderOptions:
     encoders: dict[Type, Callable[[Any], Any]] = field(default_factory=lambda: {
         datetime:   lambda value: value.isoformat().replace("+00:00", "Z"),
         timedelta:  lambda value: _encode_timedelta(value),
-        Enum:       lambda value: value.name,
+        Enum:       lambda value: _encode_enum(value),
         UUID:       lambda value: str(value)
     })
 
     decoders: dict[Type, Callable[[Type, Any], Any]] = field(default_factory=lambda: {
         datetime:   lambda       _, value: datetime.fromisoformat((value[0:26] + value[26 + 1:]).replace("Z", "+00:00")),
         timedelta:  lambda       _, value: _decode_timedelta(value),
-        Enum:       lambda typeCls, value: cast(Type[Enum], typeCls)[value],
+        Enum:       lambda typeCls, value: _decode_enum(typeCls, value),
         UUID:       lambda       _, value: UUID(value)
     })
 
@@ -196,6 +196,33 @@ def _decode_timedelta(value: str):
     else:
         raise Exception(f"Unable to decode {value} into value of type timedelta.")
 
+def _decode_enum(type_cls: Type, value: str):
+    enum_type = cast(Type[Enum], type_cls)
+
+    if value in enum_type.__members__:
+        return enum_type[value]
+
+    upper_value = to_constant_case(value)
+
+    if upper_value in enum_type.__members__:
+        return enum_type[upper_value]
+
+    return enum_type[value]
+
+def _encode_enum(value: Enum) -> str:
+    name = value.name
+
+    if name.startswith("UINT"):
+        return "UInt" + name[4:]
+
+    if name.startswith("INT"):
+        return "Int" + name[3:]
+
+    if name.startswith("FLOAT"):
+        return "Float" + name[5:]
+
+    return name
+
 def to_camel_case(value: str) -> str:
     components = value.split("_")
     return components[0] + ''.join(x.title() for x in components[1:])
@@ -204,3 +231,6 @@ snake_case_pattern = re.compile('((?<=[a-z0-9])[A-Z]|(?!^)[A-Z](?=[a-z]))')
 
 def to_snake_case(value: str) -> str:
     return snake_case_pattern.sub(r'_\1', value).lower()
+
+def to_constant_case(value: str) -> str:
+    return to_snake_case(value).upper()

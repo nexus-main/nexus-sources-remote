@@ -1,8 +1,9 @@
 using System.Diagnostics;
+using Xunit;
 
 namespace Nexus.Sources.Tests;
 
-public class RemoteTestsFixture : IDisposable
+public class RemoteTestsFixture : IAsyncLifetime
 {
     private Process? _buildProcess_dotnet;
 
@@ -14,18 +15,13 @@ public class RemoteTestsFixture : IDisposable
 
     private readonly SemaphoreSlim _semaphoreRun = new(0, 1);
 
-    public RemoteTestsFixture()
+    public Task InitializeAsync()
     {
-        Initialize = Task.Run(() =>
-        {
-            var dotnetTask = RunDotnetAgent();
-            var pythonTask = RunPythonAgent();
+        var dotnetTask = RunDotnetAgent();
+        var pythonTask = RunPythonAgent();
 
-            return Task.WhenAll(dotnetTask, pythonTask);
-        });
+        return Task.WhenAll(dotnetTask, pythonTask);
     }
-
-    public Task Initialize { get; }
 
     private async Task RunDotnetAgent()
     {
@@ -37,7 +33,7 @@ public class RemoteTestsFixture : IDisposable
         var psi_build = new ProcessStartInfo("bash")
         {
             /* Why `sleep infinity`? Because the test debugger seems to stop whenever a child process stops */
-            Arguments = "-c \"dotnet build ../../../../src/agent/dotnet/agent.csproj && sleep infinity\"",
+            Arguments = "-c \"dotnet build ../../../../src/agent/dotnet/agent.csproj && echo 'Build succeeded' && sleep infinity\"",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true
@@ -86,6 +82,7 @@ public class RemoteTestsFixture : IDisposable
         };
 
         psi_run.Environment["NEXUSAGENT_PATHS__CONFIG"] = "../../../.nexus-agent-dotnet/config";
+        psi_run.Environment["NEXUSAGENT_PATHS__PACKAGES"] = "../../../.nexus-agent-dotnet/packages";
         psi_run.Environment["NEXUSAGENT_SYSTEM__JSONRPCLISTENPORT"] = "60000";
 
         _runProcess_dotnet = new Process
@@ -139,6 +136,7 @@ public class RemoteTestsFixture : IDisposable
 
         psi_run.Environment["PYTHONPATH"] = "../../remoting/python";
         psi_run.Environment["NEXUSAGENT_PATHS__CONFIG"] = "../../../.nexus-agent-python/config";
+        psi_run.Environment["NEXUSAGENT_PATHS__PACKAGES"] = "../../../.nexus-agent-python/packages";
         psi_run.Environment["NEXUSAGENT_SYSTEM__JSONRPCLISTENPORT"] = "60001";
 
         _runProcess_python = new Process
@@ -164,6 +162,12 @@ public class RemoteTestsFixture : IDisposable
         {
             // File.AppendAllText("/home/vincent/Downloads/error.txt", e.Data + Environment.NewLine);
 
+            if (e.Data is not null && e.Data.Contains("Application startup complete."))
+            {
+                success = true;
+                _semaphoreRun.Release();
+            }
+
             if (e.Data is not null && e.Data.ToLower().Contains("error"))
             {
                 var oldSuccess = success;
@@ -184,10 +188,12 @@ public class RemoteTestsFixture : IDisposable
             throw new Exception("Unable to launch Nexus.Agent (python).");
     }
 
-    public void Dispose()
+    public Task DisposeAsync()
     {
         _buildProcess_dotnet?.Kill();
         _runProcess_dotnet?.Kill();
         _runProcess_python?.Kill();
+
+        return Task.CompletedTask;
     }
 }

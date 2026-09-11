@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.request import url2pathname
+from urllib.parse import unquote
 
 from nexus_extensibility import (CatalogRegistration, CatalogTimeRange,
                                  DataSourceContext, IDataSource,
@@ -45,7 +45,12 @@ class Test(TestBase, IDataSource[TestSettings]):
         if (context.resource_locator.scheme != "file"):
             raise Exception(f"Expected 'file' URI scheme, but got '{context.resource_locator.scheme}'.")
 
-        self._root = context.resource_locator.path
+        root = unquote(context.resource_locator.path)
+
+        if root.startswith("//"):
+            root = root[1:]
+
+        self._root = root
 
         logger.log(LogLevel.Information, self._context.source_configuration.log_message)
 
@@ -112,7 +117,7 @@ class Test(TestBase, IDataSource[TestSettings]):
         if catalog_id != "/A/B/C":
             raise Exception("Unknown catalog identifier.")
 
-        file_paths = glob.glob(url2pathname(self._root) + "/**/*.dat", recursive=True)
+        file_paths = glob.glob(self._root + "/**/*.dat", recursive=True)
         file_names = [os.path.basename(file_path) for file_path in file_paths]
         date_times = sorted([datetime.strptime(fileName, '%Y-%m-%d_%H-%M-%S.dat') for fileName in file_names])
         begin = date_times[0].replace(tzinfo = timezone.utc)
@@ -127,7 +132,7 @@ class Test(TestBase, IDataSource[TestSettings]):
 
         period_per_file = timedelta(minutes = 10)
         max_file_count = (end - begin).total_seconds() / period_per_file.total_seconds()
-        file_paths = glob.glob(url2pathname(self._root) + "/**/*.dat", recursive=True)
+        file_paths = glob.glob(self._root + "/**/*.dat", recursive=True)
         file_names = [os.path.basename(file_path) for file_path in file_paths]
         date_times = [datetime.strptime(fileName, "%Y-%m-%d_%H-%M-%S.dat").replace(tzinfo=timezone.utc) for fileName in file_names]
         filtered_date_times = [current for current in date_times if current >= begin and current < end]
@@ -179,7 +184,7 @@ class Test(TestBase, IDataSource[TestSettings]):
             while current_begin < end:
 
                 # find files
-                search_pattern = url2pathname(self._root) + \
+                search_pattern = self._root + \
                     f"/{current_begin.strftime('%Y-%m')}/{current_begin.strftime('%Y-%m-%d')}/*.dat"
 
                 file_paths = glob.glob(search_pattern, recursive=True)
@@ -213,6 +218,8 @@ class Test(TestBase, IDataSource[TestSettings]):
 
                 current_begin += timedelta(days = 1)
 
+            await request.complete()
+
     async def _read_and_modify_nexus_data(
         self, 
         begin: datetime, 
@@ -230,3 +237,5 @@ class Test(TestBase, IDataSource[TestSettings]):
 
             for i in range(0, len(request.status)):
                 request.status[i] = 1
+
+            await request.complete()

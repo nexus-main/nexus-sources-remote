@@ -1,3 +1,9 @@
+## v2.0.0-beta.58 - 2026-09-11
+
+- Update Nexus.Extensibility dependencies and migrate remote read request handling.
+- Update Python remoting compatibility for Nexus.Extensibility beta.56.
+- Improve remote agent test startup and package cache isolation.
+
 ## v2.0.0-beta.57 - 2025-02-14
 
 - Fix deserialization of pipelines

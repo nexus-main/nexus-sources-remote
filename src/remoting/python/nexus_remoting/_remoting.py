@@ -266,7 +266,10 @@ class RemoteCommunicator:
             original_resource_name = params[2]
             catalog_item = JsonEncoder.decode(CatalogItem, params[3], _json_encoder_options)
             (data, status) = ExtensibilityUtilities.create_buffers(catalog_item.representation, begin, end)
-            read_request = ReadRequest(original_resource_name, catalog_item, data, status)
+            async def complete_read_request() -> None:
+                pass
+
+            read_request = ReadRequest(original_resource_name, catalog_item, data, status, complete_read_request)
 
             await self._data_source.read(
                 begin, 

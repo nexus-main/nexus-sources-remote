@@ -357,7 +357,7 @@ public class RemoteCommunicator
 
             var catalogItem = JsonSerializer.Deserialize<CatalogItem>(@params[3], Utilities.JsonSerializerOptions)!;
             (data, status) = ExtensibilityUtilities.CreateBuffers(catalogItem.Representation, begin, end);
-            var readRequest = new ReadRequest(originalResourceName, catalogItem, data, status);
+            var readRequest = new ReadRequest(originalResourceName, catalogItem, data, status, _ => Task.CompletedTask, CancellationToken.None);
 
             await _dataSource.ReadAsync(
                 begin,
