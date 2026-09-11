@@ -107,7 +107,8 @@ internal class RemoteCommunicator : IDisposable
         CancellationToken cancellationToken
     )
     {
-        var length = BitConverter.GetBytes(buffer.Length).Reverse().ToArray();
+        var length = BitConverter.GetBytes(buffer.Length);
+        Array.Reverse(length);
 
         await target.WriteAsync(length, cancellationToken);
         await target.WriteAsync(buffer, cancellationToken);
