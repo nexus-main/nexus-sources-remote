@@ -1,3 +1,7 @@
+## v2.0.0-beta.59 - 2026-09-30
+
+- Update Nexus.Extensibility dependencies to beta.58 (.NET and Python).
+
 ## v2.0.0-beta.58 - 2026-09-11
 
 - Update Nexus.Extensibility dependencies and migrate remote read request handling.
