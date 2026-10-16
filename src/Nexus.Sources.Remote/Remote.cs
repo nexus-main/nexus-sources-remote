@@ -27,6 +27,11 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
 
     private static readonly int API_LEVEL = 1;
 
+    /* The JSON-RPC data channel is a single, sequential stream: the binary data and 
+     * status frames of a request must not interleave with those of another request. 
+     * This semaphore serializes concurrent ReadAsync invocations. */
+    private readonly SemaphoreSlim _readSemaphore = new(1, 1);
+
     private RemoteCommunicator _communicator = default!;
     
     private IJsonRpcServer _rpcServer = default!;
@@ -180,32 +185,45 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
         IProgress<double> progress,
         CancellationToken cancellationToken)
     {
-        _readData = readData;
+        cancellationToken.ThrowIfCancellationRequested();
+
+        await _readSemaphore.WaitAsync(cancellationToken);
 
         try
         {
-            var counter = 0.0;
+            _readData = readData;
 
-            foreach (var request in requests)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                var counter = 0.0;
 
-                var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(1));
-                cancellationToken.Register(timeoutTokenSource.Cancel);
+                foreach (var request in requests)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                await _rpcServer
-                    .ReadSingleAsync(begin, end, request.OriginalResourceName, request.CatalogItem, timeoutTokenSource.Token);
+                    var timeoutTokenSource = new CancellationTokenSource(TimeSpan.FromMinutes(1));
+                    cancellationToken.Register(timeoutTokenSource.Cancel);
 
-                await _communicator.ReadRawAsync(request.Data, timeoutTokenSource.Token);
-                await _communicator.ReadRawAsync(request.Status, timeoutTokenSource.Token);
-                await request.CompleteAsync();
+                    await _rpcServer
+                        .ReadSingleAsync(begin, end, request.OriginalResourceName, request.CatalogItem, timeoutTokenSource.Token);
 
-                progress.Report(++counter / requests.Length);
+                    await _communicator.ReadRawAsync(request.Data, timeoutTokenSource.Token);
+                    await _communicator.ReadRawAsync(request.Status, timeoutTokenSource.Token);
+                    await request.CompleteAsync();
+
+                    progress.Report(++counter / requests.Length);
+                }
+            }
+
+            finally
+            {
+                _readData = null;
             }
         }
+
         finally
         {
-            _readData = null;
+            _readSemaphore.Release();
         }
     }
 
@@ -296,6 +314,7 @@ public partial class Remote : IDataSource<RemoteSettings>, IUpgradableDataSource
             if (disposing)
             {
                 _communicator?.Dispose();
+                _readSemaphore.Dispose();
             }
 
             _disposedValue = true;
